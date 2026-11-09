@@ -27,7 +27,7 @@ setopt no_unset pipe_fail extended_glob
 zmodload zsh/datetime zsh/system || exit 70
 zmodload -F zsh/stat b:zstat || exit 70
 
-typeset -r TA_VERSION=1.0.0
+typeset -r TA_VERSION=1.1.0
 typeset -r TA_LABEL=io.github.jhongwe1.termawake
 
 # ---- 檔案位置（TERMAWAKE_* 環境變數只給自動測試用）----------------------------
@@ -55,7 +55,7 @@ BATTERY_MIN=20    # 使用電池時，電量「低於」這個百分比就恢復
 INTERVAL=5        # 每幾秒檢查一次
 
 # ---- 執行期間的狀態 ------------------------------------------------------------
-typeset -g ENGAGED=0 FOREIGN=0 STOPPING=0 LOWBATT_LATCH=0 LOOPS=0 ON_BATTERY=0 ENGAGE_SKIP=0
+typeset -g ENGAGED=0 FOREIGN=0 STOPPING=0 LOWBATT_LATCH=0 LOOPS=0 ON_BATTERY=0 ENGAGE_SKIP=0 LID_HANDLED=0
 typeset -g RUNNING_APP= DESIRE_REASON= CURRENT_STATE= BOOT_ID= BATT_PCT=
 typeset -g LOCK_FD=-1 WAKE_FD=-1
 typeset -gA LOGGED_ONCE
@@ -160,7 +160,7 @@ read_sleep_disabled() {
 
 lid_closed() {
   local out
-  out=$($IOREG -r -k AppleClamshellState -d 1 2>/dev/null) || return 1
+  out=$($IOREG -r -n IOPMrootDomain -d 1 2>/dev/null) || return 1
   [[ $out == *'"AppleClamshellState" = Yes'* ]]
 }
 
@@ -346,6 +346,29 @@ sleep_if_lid_closed() {
   $PMSET sleepnow >/dev/null 2>&1 || log "WARN: pmset sleepnow 失敗"
 }
 
+# 禁止睡眠時，合上蓋子 macOS「不會」關螢幕：平常的關螢幕是「睡眠」順便做的，
+# 睡眠被擋掉就不會發生，螢幕會一直亮到閒置計時（電池 2 分鐘／接電 10 分鐘）才關。
+# （使用者實測發現：pmset log 在合蓋時完全沒有 "Display is turned off"。）
+# 所以蓋子一合上就主動關螢幕；每次合蓋只做一次，打開蓋子後重置。
+turn_off_display_if_lid_closed() {
+  if ! lid_closed; then
+    LID_HANDLED=0
+    return 0
+  fi
+  (( LID_HANDLED )) && return 0
+  LID_HANDLED=1
+  local ext
+  if ext=$(external_display_count) && (( ext > 0 )); then
+    log "LID: 蓋子合上，但接了 ${ext} 台外接螢幕（桌面模式）→ 不關螢幕"
+    return 0
+  fi
+  if $PMSET displaysleepnow >/dev/null 2>&1; then
+    log "LID: 蓋子合上 → 關閉螢幕（Mac 不睡，背景程式和網路照常運作）"
+  else
+    log "WARN: pmset displaysleepnow 失敗 → 螢幕會等閒置計時到了才關"
+  fi
+}
+
 # =============================================================================
 #  監視程式本體
 # =============================================================================
@@ -387,7 +410,6 @@ on_exit() {
 }
 
 watch_loop() {
-  local tick junk
   while true; do
     if load_config; then
       LOWBATT_LATCH=0   # 門檻改了 → 低電量鎖定用新門檻重新判斷
@@ -403,29 +425,46 @@ watch_loop() {
           ENGAGE_SKIP=5
         fi
       fi
-      if (( ENGAGED )); then set_state engaged
+      if (( ENGAGED )); then
+        set_state engaged
+        turn_off_display_if_lid_closed
       elif (( FOREIGN )); then set_state foreign
       else set_state error-engage
       fi
     elif (( ENGAGED )) || [[ -e $MARKER ]]; then
-      ENGAGE_SKIP=0
+      ENGAGE_SKIP=0 LID_HANDLED=0
       if release $DESIRE_REASON 1; then set_state $DESIRE_REASON; else set_state error-release; fi
     else
-      ENGAGE_SKIP=0   # 例如 Terminal 關掉再打開 → 下次立刻重試
+      ENGAGE_SKIP=0 LID_HANDLED=0   # 例如 Terminal 關掉再打開 → 下次立刻重試
       set_state $DESIRE_REASON
     fi
     (( ++LOOPS % 720 )) || rotate_log
-    tick=${TERMAWAKE_TICK:-$INTERVAL}
-    # 等待：用 FIFO 的 read -t，而不是 zselect。
-    # 實測 zselect 等待中收到 TERM 不會中斷（要等到逾時），會拖慢登出/關機；
-    # read -t 會立刻被打斷，而且 termawake pause/resume 寫一個字進 FIFO 就能馬上喚醒。
-    if (( WAKE_FD >= 0 )); then
-      read -t $tick -u $WAKE_FD junk
-      while read -t 0 -k 1 -u $WAKE_FD junk; do :; done
-    else
-      /bin/sleep $tick & wait $!
-    fi
+    wait_until_next_check ${TERMAWAKE_TICK:-$INTERVAL}
   done
+}
+
+# 等到下一次完整檢查（$1 秒）。
+#  - 用 FIFO 的 read -t，而不是 zselect：實測 zselect 等待中收到 TERM 不會中斷
+#    （要等到逾時），會拖慢登出/關機；read -t 會立刻被打斷。
+#  - termawake pause/resume 寫一個字進 FIFO → 提早結束等待，馬上重新檢查。
+#  - 防睡眠生效期間，每 1 秒檢查一次蓋子：合上就幾乎馬上關螢幕。
+#    （只有這時候才這麼頻繁；那時整台 Mac 本來就醒著，多出來的耗電可以忽略。）
+wait_until_next_check() {
+  local total=$1 step=$1 waited=0 junk
+  (( ENGAGED && step > 1 )) && step=1
+  while (( waited < total )); do
+    if (( WAKE_FD >= 0 )); then
+      if read -t $step -u $WAKE_FD junk; then
+        while read -t 0 -k 1 -u $WAKE_FD junk; do :; done
+        return 0
+      fi
+    else
+      /bin/sleep $step & wait $!
+    fi
+    waited=$(( waited + step ))
+    (( ENGAGED )) && turn_off_display_if_lid_closed
+  done
+  return 0
 }
 
 # =============================================================================
@@ -483,7 +522,7 @@ cmd_status() {
     headline="⚠️  監視程式沒有在執行（TermAwake 目前沒有作用）→ 請重新執行 install.sh，或用 termawake log 看原因"
   else
     case $state in
-      (engaged)         headline="✅ 防睡眠生效中：Mac 不會進入系統睡眠，合上蓋子也會繼續跑（螢幕照樣會自己關）" ;;
+      (engaged)         headline="✅ 防睡眠生效中：Mac 不會進入系統睡眠，合上蓋子也會繼續跑（蓋子合上時螢幕會關掉）" ;;
       (foreign)         headline="ℹ️  SleepDisabled 原本就是 1（不是 TermAwake 設的）→ Mac 本來就不會睡，TermAwake 不會去動它" ;;
       (app-not-running) headline="💤 ${APPS} 沒有開 → Mac 會正常睡眠（打開 ${APPS} 就會自動啟用）" ;;
       (paused)          headline="⏸  暫停中 → Mac 會正常睡眠（恢復請輸入：termawake resume）" ;;

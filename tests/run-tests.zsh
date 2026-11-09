@@ -39,6 +39,7 @@ case "$*" in
     print -r -- $3 >| $T/sd
     print -r -- "disablesleep $3" >> $T/calls ;;
   ('sleepnow') print sleepnow >> $T/calls ;;
+  ('displaysleepnow') print displaysleepnow >> $T/calls ;;
   (*) print -r -- "UNEXPECTED pmset $*" >> $T/calls; exit 1 ;;
 esac
 EOF
@@ -310,13 +311,43 @@ stays "夾帶的指令沒有被執行" 0.6 '[[ ! -e $T/pwned ]]'
 print -l 'APPS=FakeTermApp' 'BATTERY_MIN=20' >| $T/state/config
 check "（恢復正常設定）" '[[ $(sd) == 1 ]]'
 
-section "18. 安全檢查"
+section "18. 防睡眠時合上蓋子 → 主動關螢幕（這時 macOS 不會自己關）"
+reset_world
+app_on; start_watcher
+check "（Terminal 開 → 禁止睡眠）" '[[ $(sd) == 1 ]]'
+lid Yes
+check "合上蓋子 → 呼叫 pmset displaysleepnow 關螢幕" '(( $(count displaysleepnow) == 1 ))'
+stays "蓋子一直合著 → 只關一次，不會一直呼叫" 0.8 '(( $(count displaysleepnow) == 1 ))'
+check "Mac 仍然不睡（SleepDisabled 維持 1）" '[[ $(sd) == 1 ]]'
+lid No; sleep 0.5; lid Yes
+check "打開再合上 → 再關一次" '(( $(count displaysleepnow) == 2 ))'
+lid No; displays $WITH_EXTERNAL; sleep 0.5; lid Yes
+stays "接著外接螢幕時合上（桌面模式）→ 不關螢幕" 0.8 '(( $(count displaysleepnow) == 2 ))'
+lid No; displays $INTERNAL_ONLY; sleep 0.5
+out=$(ta pause); lid Yes
+stays "暫停時合上蓋子 → 不插手（交給 macOS 正常睡眠）" 0.8 '(( $(count displaysleepnow) == 2 ))'
+lid No; out=$(ta resume)
+check "（取消暫停 → 禁止睡眠）" '[[ $(sd) == 1 ]]'
+stop_watcher TERM
+# 用 3 秒的完整檢查間隔，確認蓋子是「每秒」檢查，而不是等到下一次完整檢查
+env $ENVV TERMAWAKE_TICK=3 /bin/zsh -f $TA run >> $T/watcher.out 2>&1 & W_PID=$!
+check "（完整檢查間隔 3 秒的監視程式：禁止睡眠）" '[[ $(sd) == 1 ]]'
+sleep 0.3; n=$(count displaysleepnow); lid Yes
+if wait_for 1.8 '(( $(count displaysleepnow) == n + 1 ))'; then
+  pass "合上蓋子 1.8 秒內就關螢幕（不用等 3 秒一次的完整檢查）"
+else
+  fail "合上蓋子 1.8 秒內沒有關螢幕（蓋子沒有每秒檢查）"
+fi
+lid No
+stop_watcher TERM
+
+section "19. 安全檢查"
 stop_watcher TERM
 check "全程只用過允許的兩條 sudo 指令" '(( $(grepc "^DENIED") == 0 ))'
 check "pgrep 每次都有帶 -a -x -u" '(( $(grepc "^BADFLAGS") == 0 ))'
 check "沒有呼叫任何預期外的 pmset 指令" '(( $(grepc "^UNEXPECTED") == 0 ))'
 
-section "19. 各個指令都能正常執行"
+section "20. 各個指令都能正常執行"
 for c in status config version help log; do
   ta $c > /dev/null 2>&1; rc=$?
   check "termawake $c" '(( rc == 0 ))'

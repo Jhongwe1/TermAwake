@@ -82,7 +82,7 @@ termawake
 會看到類似這樣的畫面：
 
 ```
-  ✅ 防睡眠生效中：Mac 不會進入系統睡眠，合上蓋子也會繼續跑（螢幕照樣會自己關）
+  ✅ 防睡眠生效中：Mac 不會進入系統睡眠，合上蓋子也會繼續跑（蓋子合上時螢幕會關掉）
 
   監視程式    執行中（PID 68350；登入時自動啟動，當掉會自動重開）
   監視對象    Terminal：開著
@@ -123,7 +123,7 @@ termawake pause
    按視窗左上角紅色的 ✕ 只會關掉視窗，Terminal 其實還開著（Dock 上的圖示下面還有一個小點）。要按 `⌘Q` 才是完全結束。
 3. **Terminal 開著的時候，蘋果選單裡的「睡眠」也會沒有作用。**
    這是 macOS 的設計：這個開關是整台電腦共用的。想睡就先 `termawake pause`。
-4. **螢幕還是會照你的設定自己關掉。** TermAwake 只擋「系統睡眠」，不會讓螢幕一直亮著。合上蓋子時螢幕一定是關的。
+4. **合上蓋子時，螢幕由 TermAwake 負責關掉。** 擋住睡眠的時候，macOS 自己**不會**在合蓋時關螢幕（詳見[開發過程第 10 點](#10-合上蓋子螢幕卻還亮著實際使用才發現)），所以 TermAwake 每秒檢查一次蓋子，一合上就關螢幕。蓋子打開時，螢幕照你原本的設定自動關閉；接著外接螢幕（桌面模式）時，TermAwake 不會去動螢幕。
 
 ---
 
@@ -159,6 +159,41 @@ pmset -g | grep SleepDisabled
 ```bash
 pmset -g log | grep -E ' (Sleep|Wake) ' | tail -5
 ```
+
+<details>
+<summary><b>進階版：同時檢查「螢幕有沒有關」、網路、耗電</b>（整段貼進一個新的 Terminal 視窗）</summary>
+
+貼上後按 Enter，看到「合蓋測試開始」就合上蓋子，大約 3 分鐘後打開；第 4 分鐘會自動顯示結果。想測久一點，把最後一行改成 `lidtest 10`（10 分鐘）。
+
+```zsh
+lidtest() {
+  local end=$(( $(date +%s) + ${1:-4} * 60 )) last=$(date +%s) now gap lid scr net bat w slept=0 off=0 wsum=0 wn=0
+  print "\n=== 合蓋測試開始 $(date +%H:%M:%S)：現在合上蓋子，約 3 分鐘後再打開，時間到會自動出結果 ===\n"
+  while (( $(date +%s) < end )); do
+    now=$(date +%s); gap=$(( now - last )); last=$now
+    (( gap > 30 )) && { slept=1; print "⚠️  這裡中斷了 $gap 秒 → Mac 睡著過"; }
+    ioreg -r -k AppleClamshellState -d 1 | grep -q '"AppleClamshellState" = Yes' && lid=合上 || lid=打開
+    pmset -g assertions | grep -q 'Prevent sleep while display is on' && scr=亮 || { scr=關; off=1; }
+    curl -fsm 3 -o /dev/null http://captive.apple.com/hotspot-detect.html && net=通 || net=斷
+    bat=$(pmset -g batt | grep -oE '[0-9]+%' | head -1)
+    w=$(ioreg -rn AppleSmartBattery | grep -oE '"SystemLoad"=[0-9]+' | cut -d= -f2)
+    [[ $lid == 合上 && -n $w ]] && { wsum=$(( wsum + w )); wn=$(( wn + 1 )); }
+    printf '%s  蓋子:%s  螢幕:%s  網路:%s  電池:%s  整台耗電:%.1fW\n' "$(date +%H:%M:%S)" $lid $scr $net $bat $(( ${w:-0} / 1000.0 ))
+    sleep 5
+  done
+  print "\n=== 結果 ==="
+  (( slept )) && print "❌ Mac 中途睡著了（看上面 ⚠️ 的地方）" || print "✅ Mac 全程沒有睡著（每 5 秒都有紀錄）"
+  (( off )) && print "✅ 螢幕有自動關掉" || print "❓ 測試期間沒有偵測到螢幕關掉"
+  (( wn )) && printf '🔋 合上蓋子時，整台 Mac 平均耗電：%.1f W\n' $(( wsum / wn / 1000.0 ))
+  print "\n系統紀錄（最近的螢幕／睡眠事件）："
+  pmset -g log | grep -E 'Display is turned|Entering Sleep|Wake from' | tail -6 | cut -c1-90
+}
+lidtest
+```
+
+合蓋期間每一行都應該是「蓋子:合上　螢幕:關　網路:通」，而且時間每 5 秒一行、沒有跳掉。
+
+</details>
 
 ### 測試 3：關掉 Terminal 會恢復嗎？
 
@@ -198,7 +233,7 @@ sleep 12; termawake log 5
 zsh tests/run-tests.zsh
 ```
 
-用假的 `pmset`、`sudo` 模擬 68 種情況（開關 Terminal、低電量、合蓋、外接螢幕、`kill -9`、重複啟動、設定檔被亂寫……）。**不會動到真正的設定，也不需要密碼。**
+用假的 `pmset`、`sudo` 模擬 78 種情況（開關 Terminal、低電量、合蓋關螢幕、外接螢幕、`kill -9`、重複啟動、設定檔被亂寫……）。**不會動到真正的設定，也不需要密碼。**
 
 ---
 
@@ -299,6 +334,7 @@ launchd 啟動監視程式（常駐，每 5 秒醒來檢查一次，幾乎不耗
    ├─ 用電池而且低於 20%？ ── 是 ────►  恢復睡眠；蓋子合著的話馬上睡
    │      │ 不是
    └────────────────────────────────►  禁止睡眠（SleepDisabled = 1）
+                                          └─ 每秒看蓋子：一合上就關螢幕
 ```
 
 ### 安全網：就算出事，也一定會改回來
@@ -406,10 +442,29 @@ macOS 內建的 `caffeinate` 是最常見的防睡眠工具。用 `pmset -g asse
 - **測試時不能用「複製的系統程式」假裝成 Terminal**：macOS 會直接把它砍掉（exit 137），因為系統程式有「啟動限制」（launch constraints）→ 改用假的 `pgrep` 來測試。
 - **改了門檻卻要等到接上電源才生效** → 設定檔一改，就用新門檻重新判斷。
 
+#### 10. 合上蓋子，螢幕卻還亮著（實際使用才發現）
+
+裝好之後我實際使用時發現：**沒有 TermAwake 時，蓋子合到某個角度螢幕就會關；裝了 TermAwake 之後，合到那個角度螢幕不會關。**
+
+說明文件一開始寫著「合上蓋子時螢幕一定是關的」，但這句話其實沒有經過實際測試。查系統紀錄（`pmset -g log`）才找到原因：
+
+- 平常合上蓋子時，macOS 是在「讓 Mac 睡覺」的同時，**順便**把螢幕關掉。紀錄裡 `Clamshell Sleep`（合蓋睡眠）和 `Display is turned off`（螢幕關閉）會在同一秒出現。
+- TermAwake 擋住了睡眠，這個「順便關螢幕」也就跟著不見了：在防睡眠期間合上蓋子，紀錄裡完全沒有 `Display is turned off`。螢幕要等閒置計時（用電池 2 分鐘、接電 10 分鐘）到了才會關。
+- 那個「角度」就是蓋子感應器判定「已合上」的位置（系統裡的 `AppleClamshellState = Yes`）。
+
+**解法：** 防睡眠生效時，每 1 秒檢查一次蓋子，一合上就用 `pmset displaysleepnow` 關螢幕。這個指令不需要管理員權限，所以 sudo 規則不用改。
+
+- 每次合蓋只關一次，打開蓋子後重新計算。
+- 接著外接螢幕時不動作，免得把正在用的外接螢幕也一起關掉。
+- Terminal 沒開時，還是維持 5 秒檢查一次。只有 Mac 被擋住睡眠時才每秒檢查：那時整台 Mac 本來就醒著在耗電，多出來的那一點點可以忽略。
+
+**學到的事：** 沒有實際測過的行為，不要寫成「一定」。
+
 ### 怎麼驗證的？
 
-- **自動測試 68 項**：用假的 `pmset`、`sudo` 模擬各種情況。假的 `sudo` 會像真的 sudoers 一樣，只放行那兩條指令，程式只要多呼叫了任何一條指令，測試就會失敗。
-- **突變測試**：故意把 3 個關鍵修正改回錯的寫法（拿掉 `pgrep -a`、拿掉失敗退避、把拿鎖的順序改錯），確認測試真的都抓得到。
+- **自動測試 78 項**：用假的 `pmset`、`sudo` 模擬各種情況。假的 `sudo` 會像真的 sudoers 一樣，只放行那兩條指令，程式只要多呼叫了任何一條指令，測試就會失敗。
+- **突變測試**：故意把 5 個關鍵修正改回錯的寫法（拿掉 `pgrep -a`、拿掉失敗退避、把拿鎖的順序改錯、拿掉每秒檢查蓋子、拿掉「每次合蓋只關一次」），確認測試真的都抓得到。
+- **耗電實測**：監視程式跑了 53 分鐘，總共只用了 2.5 秒 CPU（平均每次檢查約 0.004 秒），大約一天用掉 0.04% 的電池。同一時間的耗電分數：Terminal 9.6、Claude Code 6.6，TermAwake 0.0。
 - **實機測試**（MacBook Air M5 / macOS 26.6）：
   - `kill -9` 之後 0.57 秒自動重開並接手
   - 暫停、恢復都在 1 秒內生效
@@ -435,7 +490,7 @@ macOS 內建的 `caffeinate` 是最常見的防睡眠工具。用 `pmset -g asse
 不會。Mac 沒有睡著，Wi-Fi 會保持連線。可以用[測試 2](#測試-2合上蓋子測試最重要的一個)自己確認。
 
 **Q：螢幕會一直亮著嗎？**
-不會。螢幕照你原本的設定自動關掉；合上蓋子時螢幕一定是關的。
+不會。蓋子打開時，螢幕照你原本的設定自動關掉；蓋子合上時，TermAwake 會在 1 秒內送出關螢幕的指令（`pmset displaysleepnow`）。可以用[測試 2](#測試-2合上蓋子測試最重要的一個) 的進階版親自確認。
 
 **Q：接外接螢幕（合蓋使用）會受影響嗎？**
 不會。偵測到外接螢幕時，TermAwake 不會主動讓 Mac 睡。
