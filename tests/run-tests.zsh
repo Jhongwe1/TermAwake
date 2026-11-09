@@ -17,6 +17,7 @@ typeset -g PASS=0 FAIL=0 W_PID= rc=0
 
 cleanup() {
   [[ -n $W_PID ]] && kill -9 $W_PID 2>/dev/null
+  pkill -f -- "$T/lid_events" 2>/dev/null   # 假的蓋子小幫手（tail）
   rm -rf -- $T
 }
 trap cleanup EXIT
@@ -73,6 +74,7 @@ EOF
 cat > $T/bin/ioreg <<'EOF'
 #!/bin/zsh -f
 T=${0:A:h:h}
+print ioreg >> $T/calls   # 記下每次呼叫，用來檢查「有沒有在輪詢」
 print '+-o IOPMrootDomain  <class IOPMrootDomain>'
 print '    {'
 print '      "AppleClamshellCausesSleep" = No'
@@ -127,7 +129,8 @@ set_batt()  { # 百分比 狀態 來源
 }
 reset_world() {
   stop_watcher KILL
-  rm -rf $T/state/* $T/logs/* $T/calls $T/sudo_broken $T/app_running
+  pkill -f -- "$T/lid_events" 2>/dev/null
+  rm -rf $T/state/* $T/logs/* $T/calls $T/sudo_broken $T/app_running $T/lid_events
   print 0 >| $T/sd; lid No; displays $INTERNAL_ONLY
   set_batt 80 charging 'AC Power'
   print -l 'APPS=FakeTermApp' 'BATTERY_MIN=20' 'INTERVAL=1' >| $T/state/config
@@ -311,7 +314,7 @@ stays "夾帶的指令沒有被執行" 0.6 '[[ ! -e $T/pwned ]]'
 print -l 'APPS=FakeTermApp' 'BATTERY_MIN=20' >| $T/state/config
 check "（恢復正常設定）" '[[ $(sd) == 1 ]]'
 
-section "18. 防睡眠時合上蓋子 → 主動關螢幕（這時 macOS 不會自己關）"
+section "18. 防睡眠時合上蓋子 → 主動關螢幕（沒有 lidwatch 小幫手時：每輪完整檢查看一次蓋子）"
 reset_world
 app_on; start_watcher
 check "（Terminal 開 → 禁止睡眠）" '[[ $(sd) == 1 ]]'
@@ -329,25 +332,66 @@ stays "暫停時合上蓋子 → 不插手（交給 macOS 正常睡眠）" 0.8 '
 lid No; out=$(ta resume)
 check "（取消暫停 → 禁止睡眠）" '[[ $(sd) == 1 ]]'
 stop_watcher TERM
-# 用 3 秒的完整檢查間隔，確認蓋子是「每秒」檢查，而不是等到下一次完整檢查
-env $ENVV TERMAWAKE_TICK=3 /bin/zsh -f $TA run >> $T/watcher.out 2>&1 & W_PID=$!
-check "（完整檢查間隔 3 秒的監視程式：禁止睡眠）" '[[ $(sd) == 1 ]]'
-sleep 0.3; n=$(count displaysleepnow); lid Yes
-if wait_for 1.8 '(( $(count displaysleepnow) == n + 1 ))'; then
-  pass "合上蓋子 1.8 秒內就關螢幕（不用等 3 秒一次的完整檢查）"
-else
-  fail "合上蓋子 1.8 秒內沒有關螢幕（蓋子沒有每秒檢查）"
-fi
-lid No
-stop_watcher TERM
 
-section "19. 安全檢查"
+section "19. 有 lidwatch 小幫手時：蓋子事件來了才查，平常完全不輪詢"
+# 假的小幫手：把 $T/lid_events 新增的每一行（closed/open）原封不動輸出，模擬系統的蓋子通知
+reset_world
+cat > $T/bin/lidwatch <<'EOF'
+#!/bin/zsh -f
+T=${0:A:h:h}
+exec /usr/bin/tail -n 0 -F $T/lid_events
+EOF
+chmod +x $T/bin/lidwatch; : >| $T/lid_events
+helper_pid() { grep -oE 'LIDWATCH: .*pid [0-9]+' $T/logs/termawake.log 2>/dev/null | tail -1 | grep -oE '[0-9]+$'; }
+app_on
+# 完整檢查間隔故意設成 3 秒：如果 1 秒內就反應，代表是「事件」叫醒的，不是等下一輪
+env $ENVV TERMAWAKE_TICK=3 TERMAWAKE_LIDWATCH=$T/bin/lidwatch /bin/zsh -f $TA run >> $T/watcher.out 2>&1 & W_PID=$!
+check "（禁止睡眠）" '[[ $(sd) == 1 ]]'
+check "小幫手已啟動" 'logged "蓋子事件小幫手已啟動"'
+sleep 0.5; n_io=$(count ioreg)
+# 觀察 3.5 秒：至少涵蓋一輪完整檢查（3 秒一輪），確定連「每輪查一次」都沒有
+stays "防睡眠期間不會一直去查蓋子（3.5 秒內、經過完整檢查也沒有任何 ioreg 呼叫）" 3.5 '(( $(count ioreg) == n_io ))'
+n=$(count displaysleepnow); lid Yes; print closed >> $T/lid_events
+if wait_for 0.8 '(( $(count displaysleepnow) == n + 1 ))'; then
+  pass "收到「合上」事件 → 0.8 秒內就關螢幕（不用等 3 秒一輪的檢查）"
+else
+  fail "收到「合上」事件後 0.8 秒內沒有關螢幕"
+fi
+lid No; print open >> $T/lid_events; sleep 0.3
+lid Yes; print closed >> $T/lid_events
+check "打開再合上 → 再關一次" '(( $(count displaysleepnow) == n + 2 ))'
+check "紀錄檔有蓋子事件" 'logged "蓋子事件 → 合上"'
+lid No; print open >> $T/lid_events
+hp1=$(helper_pid); kill $hp1
+if wait_for 4 '[[ -n $(helper_pid) && $(helper_pid) != $hp1 ]]'; then pass "小幫手意外結束 → 監視程式自動重新啟動它"; else fail "小幫手結束後沒有被重新啟動"; fi
+hp2=$(helper_pid)
+stop_watcher TERM
+check "監視程式結束時，小幫手也一起結束" '! alive $hp2'
+
+section "20. 真的 lidwatch（這台電腦有編譯器才測）"
+if /usr/bin/xcode-select -p >/dev/null 2>&1 &&
+   /usr/bin/xcrun cc -O2 -Wall -Wextra -Werror -framework IOKit -framework CoreFoundation \
+     -o $T/lidwatch-real $ROOT/src/lidwatch.c 2>$T/cc.err; then
+  pass "src/lidwatch.c 編譯成功，而且沒有任何警告（-Wall -Wextra -Werror）"
+  reset_world; app_on
+  env $ENVV TERMAWAKE_LIDWATCH=$T/lidwatch-real /bin/zsh -f $TA run >> $T/watcher.out 2>&1 & W_PID=$!
+  check "（禁止睡眠）" '[[ $(sd) == 1 ]]'
+  check "真的小幫手成功向系統登記，持續在等蓋子事件" '/usr/bin/pgrep -q -P $W_PID -x lidwatch-real'
+  rp=$(/usr/bin/pgrep -P $W_PID -x lidwatch-real)
+  stays "等待事件時不會自己結束" 1 'alive $rp'
+  stop_watcher KILL
+  check "監視程式被 kill -9 → 小幫手也立刻跟著結束（不會變孤兒）" '! alive $rp'
+else
+  print "  （這台電腦沒有編譯器，略過；錯誤訊息：$(<$T/cc.err 2>/dev/null)）"
+fi
+
+section "21. 安全檢查"
 stop_watcher TERM
 check "全程只用過允許的兩條 sudo 指令" '(( $(grepc "^DENIED") == 0 ))'
 check "pgrep 每次都有帶 -a -x -u" '(( $(grepc "^BADFLAGS") == 0 ))'
 check "沒有呼叫任何預期外的 pmset 指令" '(( $(grepc "^UNEXPECTED") == 0 ))'
 
-section "20. 各個指令都能正常執行"
+section "22. 各個指令都能正常執行"
 for c in status config version help log; do
   ta $c > /dev/null 2>&1; rc=$?
   check "termawake $c" '(( rc == 0 ))'

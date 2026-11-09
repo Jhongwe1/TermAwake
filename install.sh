@@ -212,6 +212,41 @@ install_file $SRC_DIR/uninstall.sh "$APP_DIR/uninstall.sh" 755 || die "無法複
 ok "程式：~/Library/Application Support/TermAwake/termawake"
 info "（不放在桌面或「文件」：macOS 會擋背景程式讀取那些資料夾）"
 
+# 蓋子事件小幫手（src/lidwatch.c）：合上蓋子會立刻關螢幕，平常完全不用輪詢。
+# 需要 Xcode 命令列工具才能編譯；沒有的話退回「每 INTERVAL 秒檢查一次蓋子」。
+# 先用 xcode-select -p 檢查：直接呼叫 cc 在沒裝工具的電腦上會跳出安裝視窗。
+LIDWATCH="$APP_DIR/lidwatch"
+LW_LOG="$LOG_DIR/lidwatch-build.log"
+if [[ ! -r $SRC_DIR/src/lidwatch.c ]]; then
+  /bin/rm -f -- $LIDWATCH
+  warn "找不到 src/lidwatch.c → 合上蓋子後最多 ${INTERVAL} 秒才關螢幕"
+elif ! /usr/bin/xcode-select -p >/dev/null 2>&1; then
+  /bin/rm -f -- $LIDWATCH
+  warn "沒有 Xcode 命令列工具 → 合上蓋子後最多 ${INTERVAL} 秒才關螢幕"
+  info "想要合蓋立刻關螢幕：執行 xcode-select --install，裝好後重新執行 ./install.sh"
+else
+  LW_TMP="$LIDWATCH.tmp.$$"
+  if /usr/bin/xcrun cc -O2 -Wall -Wextra -framework IOKit -framework CoreFoundation \
+       -o $LW_TMP $SRC_DIR/src/lidwatch.c 2>$LW_LOG; then
+    # 自我測試：要能成功向系統登記並持續等待（登記失敗的話會馬上自己結束）
+    $LW_TMP >/dev/null 2>>$LW_LOG &
+    lw_pid=$!
+    /bin/sleep 1
+    if kill -0 $lw_pid 2>/dev/null; then
+      kill $lw_pid 2>/dev/null; wait $lw_pid 2>/dev/null
+      /bin/mv -f -- $LW_TMP $LIDWATCH
+      ok "蓋子事件小幫手：已編譯並通過自我測試（合上蓋子會立刻關螢幕，平常不用輪詢）"
+    else
+      wait $lw_pid 2>/dev/null
+      /bin/rm -f -- $LW_TMP $LIDWATCH
+      warn "蓋子事件小幫手無法啟動 → 合上蓋子後最多 ${INTERVAL} 秒才關螢幕（原因見 ~/Library/Logs/TermAwake/lidwatch-build.log）"
+    fi
+  else
+    /bin/rm -f -- $LW_TMP $LIDWATCH
+    warn "蓋子事件小幫手編譯失敗 → 合上蓋子後最多 ${INTERVAL} 秒才關螢幕（原因見 ~/Library/Logs/TermAwake/lidwatch-build.log）"
+  fi
+fi
+
 if [[ -e $LINK && ! -L $LINK ]]; then
   warn "$LINK 已經有別的檔案，不覆蓋它。請改用完整路徑執行 termawake。"
 else

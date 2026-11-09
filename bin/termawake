@@ -27,7 +27,7 @@ setopt no_unset pipe_fail extended_glob
 zmodload zsh/datetime zsh/system || exit 70
 zmodload -F zsh/stat b:zstat || exit 70
 
-typeset -r TA_VERSION=1.1.0
+typeset -r TA_VERSION=1.2.0
 typeset -r TA_LABEL=io.github.jhongwe1.termawake
 
 # ---- 檔案位置（TERMAWAKE_* 環境變數只給自動測試用）----------------------------
@@ -48,6 +48,7 @@ SUDO=${TERMAWAKE_SUDO:-/usr/bin/sudo}
 PGREP=${TERMAWAKE_PGREP:-/usr/bin/pgrep}
 IOREG=${TERMAWAKE_IOREG:-/usr/sbin/ioreg}
 SYSTEM_PROFILER=${TERMAWAKE_SYSTEM_PROFILER:-/usr/sbin/system_profiler}
+LIDWATCH_BIN=${TERMAWAKE_LIDWATCH:-$STATE_DIR/lidwatch}   # 蓋子事件小幫手（install.sh 編譯）
 
 # ---- 設定的預設值（可在 config 檔修改，存檔後幾秒內自動生效）------------------
 APPS=Terminal     # 要監視的 App 程序名稱：Terminal 或 iTerm2（多個用空白隔開）
@@ -58,6 +59,7 @@ INTERVAL=5        # 每幾秒檢查一次
 typeset -g ENGAGED=0 FOREIGN=0 STOPPING=0 LOWBATT_LATCH=0 LOOPS=0 ON_BATTERY=0 ENGAGE_SKIP=0 LID_HANDLED=0
 typeset -g RUNNING_APP= DESIRE_REASON= CURRENT_STATE= BOOT_ID= BATT_PCT=
 typeset -g LOCK_FD=-1 WAKE_FD=-1
+typeset -g LIDWATCH_PID=0 LIDWATCH_FAILS=0 LID_CHECK_PENDING=1 LID_EVENT= LID_LAST=
 typeset -gA LOGGED_ONCE
 
 # =============================================================================
@@ -369,6 +371,47 @@ turn_off_display_if_lid_closed() {
   fi
 }
 
+# 防睡眠期間的蓋子處理（每一輪完整檢查呼叫一次）
+#  - 有 lidwatch：只在「收到蓋子事件」或「剛開始防睡眠／小幫手剛啟動」時查一次 → 平常零輪詢
+#  - 沒有 lidwatch：每一輪完整檢查（預設 5 秒）都查一次
+handle_lid() {
+  case $LID_EVENT in
+    (open)   LID_HANDLED=0 ;;
+    (closed) LID_HANDLED=0          # 每個「合上」事件都當成新的一次合蓋
+             turn_off_display_if_lid_closed ;;
+    (*)      (( LID_CHECK_PENDING || ! LIDWATCH_PID )) && turn_off_display_if_lid_closed ;;
+  esac
+  LID_CHECK_PENDING=0
+}
+
+# ---- 蓋子事件小幫手（lidwatch，src/lidwatch.c）--------------------------------
+# 蓋子一動，它就寫一行 closed/open 到喚醒用的 FIFO → 監視程式立刻醒來。
+# 它自己會在父程式（這支監視程式）結束時跟著結束，就算是被 kill -9。
+start_lidwatch() {
+  LIDWATCH_PID=0
+  [[ -x $LIDWATCH_BIN && -p $WAKE_FIFO ]] || return 1
+  $LIDWATCH_BIN >> $WAKE_FIFO 2>> $LOG_DIR/launchd.log &
+  LIDWATCH_PID=$!
+  LID_CHECK_PENDING=1   # 啟動前蓋子可能就已經合著了 → 下一輪主動查一次
+  return 0
+}
+
+# 小幫手意外結束就重新啟動；一直失敗就退回「每輪查一次」
+ensure_lidwatch() {
+  (( LIDWATCH_PID )) || return 0
+  kill -0 $LIDWATCH_PID 2>/dev/null && return 0
+  if (( ++LIDWATCH_FAILS > 5 )); then
+    log "LIDWATCH: 蓋子事件小幫手一直異常結束 → 改成每 ${INTERVAL} 秒檢查一次蓋子"
+    LIDWATCH_PID=0
+    return 1
+  fi
+  if start_lidwatch; then
+    log "LIDWATCH: 蓋子事件小幫手結束了 → 已重新啟動（第 ${LIDWATCH_FAILS} 次，pid $LIDWATCH_PID）"
+  else
+    log "LIDWATCH: 蓋子事件小幫手結束了，而且無法重新啟動 → 改成每 ${INTERVAL} 秒檢查一次蓋子"
+  fi
+}
+
 # =============================================================================
 #  監視程式本體
 # =============================================================================
@@ -390,6 +433,11 @@ start_watcher() {
   load_config
   log "START: TermAwake v$TA_VERSION（pid $$）監視 ${APPS}、電池門檻 ${BATTERY_MIN}%、每 ${INTERVAL} 秒檢查一次"
   [[ -e $MARKER ]] && log "RECOVER: 發現上次留下的標記檔（上次可能當機、被強制結束或斷電）→ 重新核對"
+  if start_lidwatch; then
+    log "LIDWATCH: 蓋子事件小幫手已啟動（pid $LIDWATCH_PID）→ 合上蓋子會立刻關螢幕，平常不用輪詢"
+  else
+    log "LIDWATCH: 沒有蓋子事件小幫手（$(pretty $LIDWATCH_BIN)）→ 每 ${INTERVAL} 秒檢查一次蓋子"
+  fi
   return 0
 }
 
@@ -405,6 +453,7 @@ on_exit() {
   if (( ENGAGED )) || [[ -e $MARKER ]]; then
     release watcher-exit 0
   fi
+  (( LIDWATCH_PID )) && kill $LIDWATCH_PID 2>/dev/null
   rm -f -- $PID_FILE $STATE_FILE
   log "EXIT: 監視程式結束"
 }
@@ -427,45 +476,44 @@ watch_loop() {
       fi
       if (( ENGAGED )); then
         set_state engaged
-        turn_off_display_if_lid_closed
+        handle_lid
       elif (( FOREIGN )); then set_state foreign
       else set_state error-engage
       fi
     elif (( ENGAGED )) || [[ -e $MARKER ]]; then
-      ENGAGE_SKIP=0 LID_HANDLED=0
+      ENGAGE_SKIP=0 LID_HANDLED=0 LID_CHECK_PENDING=1
       if release $DESIRE_REASON 1; then set_state $DESIRE_REASON; else set_state error-release; fi
     else
-      ENGAGE_SKIP=0 LID_HANDLED=0   # 例如 Terminal 關掉再打開 → 下次立刻重試
+      ENGAGE_SKIP=0 LID_HANDLED=0 LID_CHECK_PENDING=1   # 例如 Terminal 關掉再打開 → 下次立刻重試
       set_state $DESIRE_REASON
     fi
     (( ++LOOPS % 720 )) || rotate_log
+    ensure_lidwatch
     wait_until_next_check ${TERMAWAKE_TICK:-$INTERVAL}
   done
 }
 
-# 等到下一次完整檢查（$1 秒）。
-#  - 用 FIFO 的 read -t，而不是 zselect：實測 zselect 等待中收到 TERM 不會中斷
-#    （要等到逾時），會拖慢登出/關機；read -t 會立刻被打斷。
-#  - termawake pause/resume 寫一個字進 FIFO → 提早結束等待，馬上重新檢查。
-#  - 防睡眠生效期間，每 1 秒檢查一次蓋子：合上就幾乎馬上關螢幕。
-#    每次檢查約 7ms CPU（實測 ioreg 主要花在程式啟動，沒有更便宜的查法），
-#    只有這時候才這麼頻繁；那時整台 Mac 本來就醒著在耗電。
+# 等到下一次完整檢查（$1 秒），或提早被喚醒：
+#  - termawake pause/resume 會寫入一行 "x"
+#  - lidwatch 會寫入 "closed" / "open"（蓋子事件）→ 記在 LID_EVENT
+# 用 FIFO 的 read -t 而不是 zselect：實測 zselect 等待中收到 TERM 不會中斷
+#（要等到逾時），會拖慢登出/關機；read -t 會立刻被打斷。
 wait_until_next_check() {
-  local total=$1 step=$1 waited=0 junk
-  (( ENGAGED && step > 1 )) && step=1
-  while (( waited < total )); do
-    if (( WAKE_FD >= 0 )); then
-      if read -t $step -u $WAKE_FD junk; then
-        while read -t 0 -k 1 -u $WAKE_FD junk; do :; done
-        return 0
-      fi
-    else
-      /bin/sleep $step & wait $!
-    fi
-    waited=$(( waited + step ))
-    # 最後一秒不用檢查：接下來的完整檢查會檢查蓋子
-    (( ENGAGED && waited < total )) && turn_off_display_if_lid_closed
+  local line
+  LID_EVENT=
+  if (( WAKE_FD < 0 )); then
+    /bin/sleep $1 & wait $!
+    return 0
+  fi
+  read -t $1 -u $WAKE_FD line || return 0
+  while true; do
+    [[ $line == (closed|open) ]] && LID_EVENT=$line
+    read -t 0 -u $WAKE_FD line || break
   done
+  if [[ -n $LID_EVENT && $LID_EVENT != $LID_LAST ]]; then
+    LID_LAST=$LID_EVENT
+    log "LIDWATCH: 蓋子事件 → $( [[ $LID_EVENT == closed ]] && print 合上 || print 打開 )"
+  fi
   return 0
 }
 
@@ -548,6 +596,14 @@ cmd_status() {
     (*) stxt="讀不到" ;;
   esac
   if [[ -e $SUDOERS_FILE ]]; then rtxt="已安裝（$SUDOERS_FILE）"; else rtxt="沒有安裝 → 請執行 install.sh"; fi
+  local ltxt
+  if [[ ! -x $LIDWATCH_BIN ]]; then
+    ltxt="每 ${INTERVAL} 秒檢查一次（沒有 lidwatch 小幫手；裝了 Xcode 命令列工具後重新執行 install.sh 就會有）"
+  elif (( watcher )) && [[ -n $wpid ]] && /usr/bin/pgrep -q -P $wpid -x ${LIDWATCH_BIN:t} 2>/dev/null; then
+    ltxt="事件通知（合上蓋子立刻關螢幕，平常不用輪詢）"
+  else
+    ltxt="lidwatch 小幫手目前沒有在執行"
+  fi
 
   print
   print -r -- "  $headline"
@@ -557,6 +613,7 @@ cmd_status() {
   print -r -- "  電源        $ptxt"
   print -r -- "  暫停        $( (( paused )) && print 是 || print 否 )"
   print -r -- "  系統設定    $stxt"
+  print -r -- "  蓋子偵測    $ltxt"
   print -r -- "  免密碼規則  $rtxt"
   print -r -- "  設定檔      $(pretty $CONFIG_FILE)"
   print -r -- "  紀錄檔      $(pretty $LOG_FILE)（termawake log 可查看）"
