@@ -1,0 +1,650 @@
+#!/bin/zsh -f
+# =============================================================================
+#  TermAwake — 只要 Terminal 開著，Mac 就不會睡（合上蓋子也照跑）
+#  https://github.com/Jhongwe1/TermAwake
+# =============================================================================
+#  平常會用到的指令：
+#    termawake            看目前狀態（等於 termawake status）
+#    termawake pause      暫停：讓 Mac 可以正常睡（Terminal 完全結束後自動解除）
+#    termawake resume     取消暫停
+#    termawake log        看最近的紀錄
+#    termawake restore    緊急：立刻把睡眠設定改回 macOS 預設
+#    termawake uninstall  完全移除
+#  給 launchd 用的：
+#    termawake run        監視程式本體（登入時自動啟動，平常不用手動執行）
+# =============================================================================
+#  安全設計（就算當機、被 kill -9、斷電也一定會改回來）
+#   1. 改設定「之前」先寫標記檔（engaged），改回來「之後」才刪掉。
+#      下次啟動看到標記 = 上次沒收拾好 → 立刻核對、收拾。
+#   2. 登出、關機、停止服務、Ctrl-C、程式出錯 → EXIT trap 一律先改回來才結束。
+#   3. launchd KeepAlive：被 kill -9 也會在約 10 秒內重新啟動並收拾。
+#   4. 只動自己改過的設定：SleepDisabled 若原本就是 1（你自己設的），完全不碰。
+#   5. sudo 一律加 -n：沒有免密碼規則就直接失敗，絕不會卡住等密碼。
+# =============================================================================
+
+emulate -R zsh
+setopt no_unset pipe_fail extended_glob
+zmodload zsh/datetime zsh/system || exit 70
+zmodload -F zsh/stat b:zstat || exit 70
+
+typeset -r TA_VERSION=1.0.0
+typeset -r TA_LABEL=io.github.jhongwe1.termawake
+
+# ---- 檔案位置（TERMAWAKE_* 環境變數只給自動測試用）----------------------------
+STATE_DIR=${TERMAWAKE_STATE_DIR:-$HOME/Library/Application Support/TermAwake}
+LOG_DIR=${TERMAWAKE_LOG_DIR:-$HOME/Library/Logs/TermAwake}
+CONFIG_FILE=$STATE_DIR/config
+MARKER=$STATE_DIR/engaged          # 存在 = 目前的 SleepDisabled=1 是 TermAwake 設的
+PAUSE_FILE=$STATE_DIR/paused       # 存在 = 使用者按了暫停（內容記錄是哪一次開機）
+STATE_FILE=$STATE_DIR/state        # 監視程式目前的判斷結果（給 status 看）
+LOCK_FILE=$STATE_DIR/watcher.lock  # 檔案鎖：保證同時只有一個監視程式
+PID_FILE=$STATE_DIR/watcher.pid
+WAKE_FIFO=$STATE_DIR/wake          # 寫一個字進去 → 監視程式立刻重新檢查
+LOG_FILE=$LOG_DIR/termawake.log
+SUDOERS_FILE=/etc/sudoers.d/termawake
+
+PMSET=${TERMAWAKE_PMSET:-/usr/bin/pmset}
+SUDO=${TERMAWAKE_SUDO:-/usr/bin/sudo}
+PGREP=${TERMAWAKE_PGREP:-/usr/bin/pgrep}
+IOREG=${TERMAWAKE_IOREG:-/usr/sbin/ioreg}
+SYSTEM_PROFILER=${TERMAWAKE_SYSTEM_PROFILER:-/usr/sbin/system_profiler}
+
+# ---- 設定的預設值（可在 config 檔修改，存檔後幾秒內自動生效）------------------
+APPS=Terminal     # 要監視的 App 程序名稱：Terminal 或 iTerm2（多個用空白隔開）
+BATTERY_MIN=20    # 使用電池時，電量「低於」這個百分比就恢復正常睡眠（0 = 關閉）
+INTERVAL=5        # 每幾秒檢查一次
+
+# ---- 執行期間的狀態 ------------------------------------------------------------
+typeset -g ENGAGED=0 FOREIGN=0 STOPPING=0 LOWBATT_LATCH=0 LOOPS=0 ON_BATTERY=0 ENGAGE_SKIP=0
+typeset -g RUNNING_APP= DESIRE_REASON= CURRENT_STATE= BOOT_ID= BATT_PCT=
+typeset -g LOCK_FD=-1 WAKE_FD=-1
+typeset -gA LOGGED_ONCE
+
+# =============================================================================
+#  小工具
+# =============================================================================
+log() {
+  local ts
+  strftime -s ts '%Y-%m-%d %H:%M:%S' $EPOCHSECONDS
+  print -r -- "$ts [$$] $*" >> $LOG_FILE 2>/dev/null
+}
+# 同一個問題只記一次（例如每 5 秒失敗一次的錯誤），問題解除後用 log_clear 重置
+log_once()  { [[ -n ${LOGGED_ONCE[$1]-} ]] && return 0; LOGGED_ONCE[$1]=1; shift; log "$@"; }
+log_clear() { unset "LOGGED_ONCE[$1]"; }
+
+pretty() { print -r -- ${1/#${(b)HOME}/\~}; }
+
+rotate_log() {
+  local -a st
+  zstat -A st +size -- $LOG_FILE 2>/dev/null || return 0
+  (( st[1] > 1048576 )) && mv -f -- $LOG_FILE $LOG_FILE.1
+  return 0
+}
+
+# 安全地讀設定檔：只認得三個 key，值也要通過格式檢查，絕不執行檔案內容。
+# 有變動回傳 0，沒變動回傳 1。
+load_config() {
+  local apps=Terminal batt=20 interval=5 line key val
+  if [[ -r $CONFIG_FILE ]]; then
+    while IFS= read -r line || [[ -n $line ]]; do
+      line=${line%%\#*}
+      [[ $line == *=* ]] || continue
+      key=${${line%%=*}//[[:space:]]/}
+      val=${line#*=}
+      val=${${val##[[:space:]]#}%%[[:space:]]#}
+      val=${${val#[\"\']}%[\"\']}
+      case $key in
+        (APPS)        [[ $val == [[:alnum:]._-]##([[:space:]]##[[:alnum:]._-]##)# ]] && apps=$val ;;
+        (BATTERY_MIN) [[ $val == <0-100> ]] && batt=$(( 10#$val )) ;;
+        (INTERVAL)    [[ $val == <1-300> ]] && interval=$(( 10#$val )) ;;
+      esac
+    done < $CONFIG_FILE
+  fi
+  [[ $apps == $APPS && $batt == $BATTERY_MIN && $interval == $INTERVAL ]] && return 1
+  APPS=$apps BATTERY_MIN=$batt INTERVAL=$interval
+  return 0
+}
+
+# 這次開機的識別碼（開機時間）。用來讓「暫停」不會跨越重開機。
+boot_id() {
+  local s
+  s=$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null) || return 1
+  [[ $s =~ 'sec = ([0-9]+)' ]] || return 1
+  print -r -- $match[1]
+}
+
+# =============================================================================
+#  偵測
+# =============================================================================
+
+# Terminal 有沒有在跑？
+# 注意一定要加 -a：macOS 的 pgrep 預設會「排除自己的祖先程序」，
+# 所以在 Terminal 裡執行 `pgrep Terminal` 會找不到 Terminal 本身。
+app_running() {
+  local name
+  for name in ${=APPS}; do
+    if $PGREP -q -a -x -u $UID $name 2>/dev/null; then
+      RUNNING_APP=$name
+      return 0
+    fi
+  done
+  RUNNING_APP=
+  return 1
+}
+
+# 讀電池狀態 → BATT_PCT（數字；沒有電池時為空）、ON_BATTERY（1 = 正在用電池）
+read_battery() {
+  local out
+  BATT_PCT= ON_BATTERY=0
+  out=$($PMSET -g batt 2>/dev/null) || return 1
+  # 「discharging」也算用電池：接了瓦數不夠的充電器時，電量一樣在往下掉
+  [[ $out == *"'Battery Power'"* || $out == *'; discharging;'* ]] && ON_BATTERY=1
+  [[ $out =~ '([0-9]+)%' ]] && BATT_PCT=$match[1]
+  return 0
+}
+
+# 讀目前的 SleepDisabled（印出 0 或 1）。
+# 注意：這個設定如果從來沒被改過，pmset -g 根本不會列出 SleepDisabled → 沒有這一行 = 0。
+#（實測：第一次 pmset -a disablesleep 之後，系統設定檔才會出現這個項目，之後就一直都在。）
+read_sleep_disabled() {
+  local out line
+  out=$($PMSET -g 2>/dev/null) || return 1
+  for line in ${(f)out}; do
+    if [[ $line =~ '^[[:space:]]*SleepDisabled[[:space:]]+([0-9]+)' ]]; then
+      print -r -- $match[1]
+      return 0
+    fi
+  done
+  print 0
+}
+
+lid_closed() {
+  local out
+  out=$($IOREG -r -k AppleClamshellState -d 1 2>/dev/null) || return 1
+  [[ $out == *'"AppleClamshellState" = Yes'* ]]
+}
+
+# 外接螢幕有幾台（印出數字；判斷不出來就回傳失敗）
+# 不用 ioreg 的 AppleClamshellCausesSleep：實測在「用電池、沒接螢幕」時也顯示 No，不可靠。
+external_display_count() {
+  local json n
+  json=$($SYSTEM_PROFILER -json SPDisplaysDataType 2>/dev/null) || return 1
+  n=$(/usr/bin/osascript -l JavaScript -e '
+function run(argv) {
+  var n = 0;
+  (JSON.parse(argv[0]).SPDisplaysDataType || []).forEach(function (gpu) {
+    (gpu.spdisplays_ndrvs || []).forEach(function (d) {
+      if (d.spdisplays_connection_type !== "spdisplays_internal") n++;
+    });
+  });
+  return String(n);
+}' "$json" 2>/dev/null) || return 1
+  [[ $n == <-> ]] || return 1
+  print -r -- $n
+}
+
+pause_active() {
+  [[ -e $PAUSE_FILE ]] || return 1
+  local content=
+  [[ -r $PAUSE_FILE ]] && content=$(<$PAUSE_FILE)
+  if [[ -n $BOOT_ID && $content != "boot=$BOOT_ID" ]]; then
+    rm -f -- $PAUSE_FILE
+    log "PAUSE: 這個暫停是上一次開機留下的 → 自動解除"
+    return 1
+  fi
+  return 0
+}
+
+power_text() {
+  if [[ -z $BATT_PCT ]]; then print -r -- "接電源"
+  elif (( ON_BATTERY )); then print -r -- "電池 ${BATT_PCT}%（使用電池）"
+  else print -r -- "電池 ${BATT_PCT}%（接電源）"
+  fi
+}
+
+reason_text() {
+  case $1 in
+    (app-not-running) print -r -- "${APPS} 已經完全結束" ;;
+    (paused)          print -r -- "你按了暫停（termawake pause）" ;;
+    (low-battery)     print -r -- "使用電池且電量 ${BATT_PCT:-?}% 低於 ${BATTERY_MIN}%" ;;
+    (watcher-exit)    print -r -- "監視程式要結束了（登出、關機、停止服務或程式出錯）" ;;
+    (*)               print -r -- $1 ;;
+  esac
+}
+
+# =============================================================================
+#  決策：現在應該禁止睡眠嗎？（是 → 回傳 0；否 → 回傳 1，原因放在 DESIRE_REASON）
+# =============================================================================
+want_awake() {
+  if ! app_running; then
+    DESIRE_REASON=app-not-running
+    if [[ -e $PAUSE_FILE ]]; then
+      rm -f -- $PAUSE_FILE
+      log "PAUSE: ${APPS} 已結束 → 自動解除暫停"
+    fi
+    return 1
+  fi
+  if pause_active; then
+    DESIRE_REASON=paused
+    return 1
+  fi
+  if read_battery; then
+    log_clear battery
+    if (( ON_BATTERY )) && [[ -n $BATT_PCT ]]; then
+      # 低電量「鎖定」：一旦觸發，要接上電源才解除，避免電量在門檻附近跳動時反覆切換
+      if (( LOWBATT_LATCH || BATT_PCT < BATTERY_MIN )); then
+        if (( ! LOWBATT_LATCH )); then
+          LOWBATT_LATCH=1
+          log "LOWBATT: 使用電池、電量 ${BATT_PCT}% 低於 ${BATTERY_MIN}% → 恢復正常睡眠（接上電源後才會再啟用）"
+        fi
+        DESIRE_REASON=low-battery
+        return 1
+      fi
+    elif (( LOWBATT_LATCH && ! ON_BATTERY )); then
+      LOWBATT_LATCH=0
+      log "POWER: 已接上電源 → 解除低電量保護"
+    fi
+  else
+    log_once battery "WARN: 讀不到電池狀態（pmset -g batt 失敗），暫時無法做低電量保護"
+  fi
+  DESIRE_REASON=
+  return 0
+}
+
+# =============================================================================
+#  動作
+# =============================================================================
+write_marker() {
+  local ts tmp=$MARKER.tmp.$$
+  strftime -s ts '%Y-%m-%d %H:%M:%S' $EPOCHSECONDS
+  print -r -- "since=$ts pid=$$ app=${RUNNING_APP:-?} original_SleepDisabled=0" >| $tmp &&
+    mv -f -- $tmp $MARKER
+}
+
+set_state() {
+  [[ $1 == $CURRENT_STATE ]] && return 0
+  CURRENT_STATE=$1
+  print -r -- $1 >| $STATE_FILE.tmp.$$ && mv -f -- $STATE_FILE.tmp.$$ $STATE_FILE
+}
+
+# 禁止睡眠（SleepDisabled → 1）
+engage() {
+  local cur
+  FOREIGN=0
+  if ! cur=$(read_sleep_disabled); then
+    log_once read-sd "ERROR: 讀不到目前的睡眠設定（pmset -g 失敗）"
+    return 1
+  fi
+  log_clear read-sd
+  if [[ $cur == 1 ]]; then
+    if [[ -e $MARKER ]]; then
+      ENGAGED=1
+      log "ADOPT: 標記檔還在、SleepDisabled 也還是 1 → 直接接手（上次可能是當機或被強制結束）"
+    else
+      FOREIGN=1
+      log_once foreign "NOTE: SleepDisabled 原本就是 1（不是 TermAwake 設的，可能是你手動設的）→ 不碰它，之後也不會幫你改回來"
+    fi
+    return 0
+  fi
+  log_clear foreign
+  # 順序很重要：先寫標記、再改設定。中間被打斷的話，下次看到標記就會收拾。
+  if ! write_marker; then
+    log_once marker "ERROR: 無法寫入標記檔 $MARKER → 為了安全，不啟用"
+    return 1
+  fi
+  log_clear marker
+  if $SUDO -n $PMSET -a disablesleep 1 >/dev/null 2>&1; then
+    ENGAGED=1
+    log_clear sudo
+    log "ENGAGE: ${RUNNING_APP} 開著，$(power_text) → SleepDisabled=1（不會睡眠，合上蓋子也照跑）"
+    return 0
+  fi
+  # 失敗了：以「實際狀態」決定標記要不要留
+  if [[ $(read_sleep_disabled 2>/dev/null) == 1 ]]; then
+    ENGAGED=1
+    log "WARN: pmset 回報失敗，但設定其實已經生效 → 保留標記"
+    return 0
+  fi
+  rm -f -- $MARKER
+  log_once sudo "ERROR: sudo -n pmset -a disablesleep 1 失敗 → 免密碼規則（$SUDOERS_FILE）可能沒裝好，請重新執行 install.sh"
+  return 1
+}
+
+# 恢復睡眠（SleepDisabled → 0）。$1 = 原因；$2 = 1 表示「蓋子合著的話，讓 Mac 立刻睡」
+release() {
+  local reason=$1 allow_sleep=${2:-0} cur=
+  # 順序很重要：先改設定、確認成功，最後才刪標記
+  if $SUDO -n $PMSET -a disablesleep 0 >/dev/null 2>&1 &&
+     cur=$(read_sleep_disabled) && [[ $cur == 0 ]]; then
+    rm -f -- $MARKER
+    ENGAGED=0
+    log_clear release
+    log "RELEASE: $(reason_text $reason) → SleepDisabled=0（恢復正常睡眠）"
+    (( allow_sleep )) && sleep_if_lid_closed $reason
+    return 0
+  fi
+  log_once release "ERROR: 恢復睡眠失敗（sudo -n pmset -a disablesleep 0，讀回=${cur:-?}）→ 每 ${INTERVAL} 秒重試。緊急時請手動執行：sudo pmset -a disablesleep 0"
+  return 1
+}
+
+# 蓋子已經合著時，就算把設定改回來，macOS 也不會再收到一次「合蓋」事件；
+# 而 Claude Code 這類程式會用 caffeinate 擋住「閒置睡眠」→ Mac 會一直醒著。
+# 所以：蓋子合著、又沒有外接螢幕時，主動讓它睡（等於 macOS 平常合蓋的行為）。
+sleep_if_lid_closed() {
+  local reason=$1 ext
+  lid_closed || return 0
+  if ext=$(external_display_count); then
+    if (( ext > 0 )); then
+      log "LID: 蓋子合著，但接了 ${ext} 台外接螢幕（桌面模式）→ 不強制睡眠"
+      return 0
+    fi
+  elif [[ $reason != low-battery ]]; then
+    log "LID: 蓋子合著，但判斷不出有沒有外接螢幕 → 保守起見不強制睡眠"
+    return 0
+  fi
+  log "SLEEP: 蓋子是合上的 → 立刻讓 Mac 睡眠（pmset sleepnow）"
+  $PMSET sleepnow >/dev/null 2>&1 || log "WARN: pmset sleepnow 失敗"
+}
+
+# =============================================================================
+#  監視程式本體
+# =============================================================================
+start_watcher() {
+  mkdir -p -- $STATE_DIR $LOG_DIR || { print -u2 -r -- "termawake: 無法建立 $STATE_DIR"; exit 73; }
+  [[ -e $LOCK_FILE ]] || : >> $LOCK_FILE
+  # 檔案鎖由作業系統管理：程式結束（包括 kill -9）時自動釋放，不會留下「假的鎖」
+  if ! zsystem flock -t 0 -f LOCK_FD $LOCK_FILE 2>/dev/null; then
+    print -u2 -r -- "termawake: 已經有一個監視程式在執行了（同時只會跑一個）。"
+    exit 75   # 注意：這裡還沒設定 trap，所以不會去動到另一個監視程式的狀態
+  fi
+  print -r -- $$ >| $PID_FILE
+  if [[ ! -p $WAKE_FIFO ]]; then
+    rm -f -- $WAKE_FIFO
+    /usr/bin/mkfifo -m 600 $WAKE_FIFO 2>/dev/null
+  fi
+  sysopen -r -w -u WAKE_FD $WAKE_FIFO 2>/dev/null || WAKE_FD=-1
+  BOOT_ID=$(boot_id 2>/dev/null)
+  load_config
+  log "START: TermAwake v$TA_VERSION（pid $$）監視 ${APPS}、電池門檻 ${BATTERY_MIN}%、每 ${INTERVAL} 秒檢查一次"
+  [[ -e $MARKER ]] && log "RECOVER: 發現上次留下的標記檔（上次可能當機、被強制結束或斷電）→ 重新核對"
+  return 0
+}
+
+on_signal() {
+  log "STOP: 收到 $1 訊號（登出、關機、停止服務或手動中斷）"
+  exit 0   # → 觸發 EXIT trap（on_exit）
+}
+
+on_exit() {
+  (( STOPPING )) && return 0
+  STOPPING=1
+  # 結束前一定先恢復睡眠。這裡「不」主動讓 Mac 睡：可能正在關機或登出。
+  if (( ENGAGED )) || [[ -e $MARKER ]]; then
+    release watcher-exit 0
+  fi
+  rm -f -- $PID_FILE $STATE_FILE
+  log "EXIT: 監視程式結束"
+}
+
+watch_loop() {
+  local tick junk
+  while true; do
+    if load_config; then
+      LOWBATT_LATCH=0   # 門檻改了 → 低電量鎖定用新門檻重新判斷
+      log "CONFIG: 設定已更新 → 監視 ${APPS}、電池門檻 ${BATTERY_MIN}%、每 ${INTERVAL} 秒檢查一次"
+    fi
+    if want_awake; then
+      if (( ! ENGAGED )); then
+        # 啟用失敗（例如免密碼規則壞了）就退避：每 6 次檢查（約 30 秒）才重試，
+        # 避免每 5 秒就在系統紀錄留下一筆 sudo 失敗
+        if (( ENGAGE_SKIP > 0 )); then
+          (( ENGAGE_SKIP-- ))
+        elif ! engage; then
+          ENGAGE_SKIP=5
+        fi
+      fi
+      if (( ENGAGED )); then set_state engaged
+      elif (( FOREIGN )); then set_state foreign
+      else set_state error-engage
+      fi
+    elif (( ENGAGED )) || [[ -e $MARKER ]]; then
+      ENGAGE_SKIP=0
+      if release $DESIRE_REASON 1; then set_state $DESIRE_REASON; else set_state error-release; fi
+    else
+      ENGAGE_SKIP=0   # 例如 Terminal 關掉再打開 → 下次立刻重試
+      set_state $DESIRE_REASON
+    fi
+    (( ++LOOPS % 720 )) || rotate_log
+    tick=${TERMAWAKE_TICK:-$INTERVAL}
+    # 等待：用 FIFO 的 read -t，而不是 zselect。
+    # 實測 zselect 等待中收到 TERM 不會中斷（要等到逾時），會拖慢登出/關機；
+    # read -t 會立刻被打斷，而且 termawake pause/resume 寫一個字進 FIFO 就能馬上喚醒。
+    if (( WAKE_FD >= 0 )); then
+      read -t $tick -u $WAKE_FD junk
+      while read -t 0 -k 1 -u $WAKE_FD junk; do :; done
+    else
+      /bin/sleep $tick & wait $!
+    fi
+  done
+}
+
+# =============================================================================
+#  使用者指令
+# =============================================================================
+poke_watcher() {
+  local w
+  [[ -p $WAKE_FIFO ]] || return 0
+  # nonblock：監視程式沒在跑時會直接失敗，而不是卡住
+  sysopen -w -o nonblock -u w $WAKE_FIFO 2>/dev/null || return 0
+  print -u $w -r -- x 2>/dev/null
+  exec {w}>&-
+  return 0
+}
+
+# 等監視程式回報成指定的狀態之一
+wait_state() {
+  local deadline=$(( EPOCHREALTIME + $1 )) s=
+  shift
+  while (( EPOCHREALTIME < deadline )); do
+    if [[ -r $STATE_FILE ]]; then
+      s=$(<$STATE_FILE)
+      (( ${@[(Ie)$s]} )) && return 0
+    fi
+    /bin/sleep 0.1
+  done
+  return 1
+}
+
+watcher_alive() {
+  local fd
+  [[ -e $LOCK_FILE ]] || return 1
+  if zsystem flock -t 0 -f fd $LOCK_FILE 2>/dev/null; then
+    zsystem flock -u $fd
+    return 1
+  fi
+  return 0
+}
+
+cmd_status() {
+  load_config
+  BOOT_ID=$(boot_id 2>/dev/null)
+  local watcher=0 wpid= state= sd paused=0 app=0 headline wtxt atxt ptxt stxt rtxt
+  if watcher_alive; then
+    watcher=1
+    [[ -r $PID_FILE ]] && wpid=$(<$PID_FILE)
+    [[ -r $STATE_FILE ]] && state=$(<$STATE_FILE)
+  fi
+  app_running && app=1
+  read_battery
+  sd=$(read_sleep_disabled 2>/dev/null) || sd='?'
+  [[ -r $PAUSE_FILE && $(<$PAUSE_FILE) == "boot=$BOOT_ID" ]] && paused=1
+
+  if (( ! watcher )); then
+    headline="⚠️  監視程式沒有在執行（TermAwake 目前沒有作用）→ 請重新執行 install.sh，或用 termawake log 看原因"
+  else
+    case $state in
+      (engaged)         headline="✅ 防睡眠生效中：Mac 不會進入系統睡眠，合上蓋子也會繼續跑（螢幕照樣會自己關）" ;;
+      (foreign)         headline="ℹ️  SleepDisabled 原本就是 1（不是 TermAwake 設的）→ Mac 本來就不會睡，TermAwake 不會去動它" ;;
+      (app-not-running) headline="💤 ${APPS} 沒有開 → Mac 會正常睡眠（打開 ${APPS} 就會自動啟用）" ;;
+      (paused)          headline="⏸  暫停中 → Mac 會正常睡眠（恢復請輸入：termawake resume）" ;;
+      (low-battery)     headline="🪫 電量低（使用電池且低於 ${BATTERY_MIN}%）→ 已恢復正常睡眠，接上電源後會自動啟用" ;;
+      (error-engage)    headline="⚠️  想啟用但失敗了（多半是免密碼規則沒裝好）→ 請重新執行 install.sh，或看 termawake log" ;;
+      (error-release)   headline="❗ 想恢復睡眠但失敗了 → 請執行 termawake restore，或 sudo pmset -a disablesleep 0" ;;
+      (*)               headline="⏳ 監視程式剛啟動，過幾秒再看一次" ;;
+    esac
+  fi
+
+  if (( watcher )); then wtxt="執行中（PID ${wpid:-?}；登入時自動啟動，當掉會自動重開）"; else wtxt="沒有在執行"; fi
+  if (( app )); then atxt="${RUNNING_APP}：開著"; else atxt="${APPS}：沒開"; fi
+  if [[ -z $BATT_PCT ]]; then ptxt="接電源（沒有偵測到電池）"
+  elif (( ON_BATTERY )); then ptxt="電池 ${BATT_PCT}%，使用電池中（低於 ${BATTERY_MIN}% 會自動恢復睡眠）"
+  else ptxt="電池 ${BATT_PCT}%，接著電源"
+  fi
+  case $sd in
+    (1) if [[ -e $MARKER ]]; then stxt="SleepDisabled = 1（TermAwake 設的；${APPS} 結束後會改回 0）"
+        else stxt="SleepDisabled = 1（不是 TermAwake 設的）"; fi ;;
+    (0) stxt="SleepDisabled = 0（macOS 預設：正常睡眠）" ;;
+    (*) stxt="讀不到" ;;
+  esac
+  if [[ -e $SUDOERS_FILE ]]; then rtxt="已安裝（$SUDOERS_FILE）"; else rtxt="沒有安裝 → 請執行 install.sh"; fi
+
+  print
+  print -r -- "  $headline"
+  print
+  print -r -- "  監視程式    $wtxt"
+  print -r -- "  監視對象    $atxt"
+  print -r -- "  電源        $ptxt"
+  print -r -- "  暫停        $( (( paused )) && print 是 || print 否 )"
+  print -r -- "  系統設定    $stxt"
+  print -r -- "  免密碼規則  $rtxt"
+  print -r -- "  設定檔      $(pretty $CONFIG_FILE)"
+  print -r -- "  紀錄檔      $(pretty $LOG_FILE)（termawake log 可查看）"
+  print
+}
+
+cmd_pause() {
+  mkdir -p -- $STATE_DIR || return 1
+  print -r -- "boot=$(boot_id 2>/dev/null)" >| $PAUSE_FILE
+  log "USER: termawake pause"
+  poke_watcher
+  if wait_state 3 paused app-not-running; then
+    print -r -- "⏸  已暫停：Mac 現在會正常睡眠（合上蓋子就會睡）。"
+  elif [[ ! -e $MARKER ]]; then
+    print -r -- "⏸  已暫停。"
+  elif $SUDO -n $PMSET -a disablesleep 0 >/dev/null 2>&1; then
+    rm -f -- $MARKER
+    log "USER: 監視程式沒有回應 → 由 pause 指令直接恢復睡眠"
+    print -r -- "⏸  已暫停（監視程式沒有回應，已直接把睡眠設定改回來）。"
+  else
+    print -r -- "❌ 已標記暫停，但改不回睡眠設定。請手動執行（會問密碼）：sudo pmset -a disablesleep 0"
+    return 1
+  fi
+  print -r -- "   ${APPS} 完全結束（⌘Q）後會自動解除暫停；想馬上恢復防睡眠：termawake resume"
+}
+
+cmd_resume() {
+  rm -f -- $PAUSE_FILE
+  log "USER: termawake resume"
+  poke_watcher
+  if wait_state 3 engaged; then
+    print -r -- "▶️  已恢復：防睡眠生效中（合上蓋子也會繼續跑）。"
+  else
+    print -r -- "▶️  已取消暫停。目前狀態："
+    cmd_status
+  fi
+}
+
+cmd_restore() {
+  mkdir -p -- $STATE_DIR || return 1
+  print -r -- "boot=$(boot_id 2>/dev/null)" >| $PAUSE_FILE
+  poke_watcher
+  if $SUDO -n $PMSET -a disablesleep 0 >/dev/null 2>&1; then
+    rm -f -- $MARKER
+    log "USER: termawake restore（緊急恢復：SleepDisabled=0，並進入暫停）"
+    print -r -- "✅ 已恢復正常睡眠（SleepDisabled = $(read_sleep_disabled)）。"
+    print -r -- "   TermAwake 同時進入暫停：${APPS} 完全結束後自動解除，或輸入 termawake resume。"
+  else
+    print -r -- "❌ 免密碼規則無法使用。請手動執行（會問密碼）：sudo pmset -a disablesleep 0"
+    return 1
+  fi
+}
+
+cmd_log() {
+  if [[ ! -r $LOG_FILE ]]; then
+    print -r -- "還沒有任何紀錄（$(pretty $LOG_FILE)）。"
+    return 0
+  fi
+  if [[ ${1-} == -f ]]; then
+    exec /usr/bin/tail -n 20 -f -- $LOG_FILE
+  fi
+  local n=${1:-30}
+  [[ $n == <1-100000> ]] || n=30
+  /usr/bin/tail -n $n -- $LOG_FILE
+}
+
+cmd_config() {
+  load_config
+  print -r -- "設定檔：$(pretty $CONFIG_FILE)"
+  print -r -- "  APPS=$APPS            （監視哪個 App）"
+  print -r -- "  BATTERY_MIN=$BATTERY_MIN       （用電池時低於幾 % 就恢復睡眠）"
+  print -r -- "  INTERVAL=$INTERVAL            （每幾秒檢查一次）"
+  print
+  print -r -- "要修改：open -e \"$CONFIG_FILE\""
+  print -r -- "（會用「文字編輯」打開，改完存檔，幾秒內自動生效）"
+}
+
+cmd_uninstall() {
+  local u=$STATE_DIR/uninstall.sh
+  if [[ ! -r $u ]]; then
+    print -u2 -r -- "找不到 $(pretty $u)。請到 TermAwake 資料夾裡執行：zsh uninstall.sh"
+    return 1
+  fi
+  exec /bin/zsh -f $u "$@"
+}
+
+usage() {
+  print -r -- "TermAwake $TA_VERSION — 只要 Terminal 開著，Mac 就不會睡（合上蓋子也照跑）
+
+用法：termawake <指令>
+
+  status      看目前狀態（直接輸入 termawake 也可以）
+  pause       暫停：讓 Mac 可以正常睡眠（Terminal 完全結束後自動解除）
+  resume      取消暫停
+  log [-f]    看最近的紀錄（加 -f 會持續顯示新紀錄，按 Ctrl-C 離開）
+  config      看設定檔位置和目前的設定
+  restore     緊急：立刻把睡眠設定改回 macOS 預設，並暫停
+  uninstall   完全移除 TermAwake
+  version     顯示版本
+
+說明文件：https://github.com/Jhongwe1/TermAwake"
+}
+
+# =============================================================================
+#  進入點
+# =============================================================================
+case ${1:-status} in
+  (run)
+    start_watcher            # 拿不到鎖會直接離開，不會碰任何狀態
+    # 從這裡開始，不管程式怎麼結束（訊號、出錯），都會先把睡眠設定改回來
+    trap 'on_exit' EXIT
+    trap 'on_signal HUP' HUP
+    trap 'on_signal INT' INT
+    trap 'on_signal QUIT' QUIT
+    trap 'on_signal TERM' TERM
+    watch_loop
+    ;;
+  (status)                cmd_status ;;
+  (pause)                 cmd_pause ;;
+  (resume)                cmd_resume ;;
+  (restore)               cmd_restore ;;
+  (log|logs)              shift; cmd_log "$@" ;;
+  (config)                cmd_config ;;
+  (uninstall)             shift; cmd_uninstall "$@" ;;
+  (version|-v|--version)  print -r -- "TermAwake $TA_VERSION" ;;
+  (help|-h|--help)        usage ;;
+  (*)
+    print -u2 -r -- "termawake：不認識的指令「$1」"
+    usage >&2
+    exit 64
+    ;;
+esac
