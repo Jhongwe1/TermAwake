@@ -448,7 +448,8 @@ watch_loop() {
 #    （要等到逾時），會拖慢登出/關機；read -t 會立刻被打斷。
 #  - termawake pause/resume 寫一個字進 FIFO → 提早結束等待，馬上重新檢查。
 #  - 防睡眠生效期間，每 1 秒檢查一次蓋子：合上就幾乎馬上關螢幕。
-#    （只有這時候才這麼頻繁；那時整台 Mac 本來就醒著，多出來的耗電可以忽略。）
+#    每次檢查約 7ms CPU（實測 ioreg 主要花在程式啟動，沒有更便宜的查法），
+#    只有這時候才這麼頻繁；那時整台 Mac 本來就醒著在耗電。
 wait_until_next_check() {
   local total=$1 step=$1 waited=0 junk
   (( ENGAGED && step > 1 )) && step=1
@@ -462,7 +463,8 @@ wait_until_next_check() {
       /bin/sleep $step & wait $!
     fi
     waited=$(( waited + step ))
-    (( ENGAGED )) && turn_off_display_if_lid_closed
+    # 最後一秒不用檢查：接下來的完整檢查會檢查蓋子
+    (( ENGAGED && waited < total )) && turn_off_display_if_lid_closed
   done
   return 0
 }
