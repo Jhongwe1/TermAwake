@@ -15,6 +15,7 @@ typeset -r LABEL=io.github.jhongwe1.termawake
 typeset -r SRC_DIR=${0:A:h}
 typeset -r APP_DIR="$HOME/Library/Application Support/TermAwake"
 typeset -r BIN="$APP_DIR/termawake"
+typeset -r HELPER="$APP_DIR/tawatch"
 typeset -r CONFIG="$APP_DIR/config"
 typeset -r STATE_FILE="$APP_DIR/state"
 typeset -r LINK="$HOME/.local/bin/termawake"
@@ -30,10 +31,12 @@ warn() { print -r -- "   ⚠️  $*"; }
 die()  { print -r -- "" >&2; print -r -- "❌ $*" >&2; exit 1; }
 
 usage() {
-  print -r -- "用法：./install.sh [--app Terminal|iTerm2] [--battery 0-100]
+  print -r -- "用法：./install.sh [--app Terminal|iTerm2] [--battery 5-100]
 
   --app       要監視的終端機 App（不指定就自動判斷）
-  --battery   用電池時，電量低於幾 % 就恢復正常睡眠（預設 20；0 = 關閉）"
+  --battery   用電池時，電量低於幾 % 就恢復正常睡眠（預設 20，最低 5）
+
+其他設定（過熱門檻、低耗電模式、合蓋閒置……）裝好後在設定檔裡改：termawake config"
 }
 
 # 用 root 身分執行一段 sh 指令：
@@ -108,10 +111,13 @@ while (( $# )); do
     (*)           usage >&2; die "看不懂的參數：$1" ;;
   esac
 done
+if [[ -n $BATT_ARG ]]; then
+  [[ $BATT_ARG == <5-100> ]] || die "--battery 要是 5 到 100 的數字（低於 5 太危險：電池可能直接用到斷電）"
+fi
 
 print -r -- "TermAwake 安裝程式 —— 只要 Terminal 開著，Mac 就不會睡（合上蓋子也照跑）"
 
-# ---- 0. 檢查環境 ---------------------------------------------------------------
+# ---- 0. 檢查環境（這一步不會改任何東西）-----------------------------------------
 step 0 "檢查環境"
 [[ $OSTYPE == darwin* ]] || die "TermAwake 只支援 macOS。"
 (( EUID != 0 )) || die "請不要用 sudo 執行。直接執行 ./install.sh 就好，需要密碼時會再問你。"
@@ -120,9 +126,37 @@ typeset -r ME=$(/usr/bin/id -un)
 [[ $ME == [A-Za-z_][A-Za-z0-9_.-]# ]] || die "帳號名稱「$ME」含有特殊字元，無法安全地寫進 sudoers。"
 [[ " $(/usr/bin/id -Gn) " == *" admin "* ]] || die "你的帳號不是管理員（admin），無法設定 sudo 規則。"
 [[ -x /usr/bin/pmset && -x /usr/sbin/visudo ]] || die "找不到 pmset 或 visudo。"
-[[ -r $SRC_DIR/bin/termawake && -r $SRC_DIR/uninstall.sh ]] || die "找不到程式檔。請在 TermAwake 資料夾裡執行 ./install.sh"
+[[ -r $SRC_DIR/bin/termawake && -r $SRC_DIR/uninstall.sh && -r $SRC_DIR/src/tawatch.m ]] ||
+  die "找不到程式檔。請在 TermAwake 資料夾裡執行 ./install.sh"
 /bin/zsh -n $SRC_DIR/bin/termawake || die "bin/termawake 有語法錯誤，請重新下載。"
-ok "macOS $(/usr/bin/sw_vers -productVersion)，帳號 $ME（管理員）"
+# 感測小幫手要在你的電腦上編譯，所以需要 Xcode 命令列工具。
+# 先用 xcode-select -p 檢查：直接呼叫 cc 在沒裝工具的電腦上會跳出安裝視窗。
+if ! /usr/bin/xcode-select -p >/dev/null 2>&1; then
+  print -r -- ""
+  print -r -- "❌ 需要先安裝「Xcode 命令列工具」（用來在你的電腦上編譯感測小幫手，免費，大約幾分鐘）。"
+  print -r -- "   1. 在 Terminal 執行：xcode-select --install"
+  print -r -- "   2. 在跳出來的視窗按「安裝」，等它裝完"
+  print -r -- "   3. 再執行一次 ./install.sh"
+  print -r -- "   （到目前為止沒有任何東西被修改。）"
+  exit 1
+fi
+ok "macOS $(/usr/bin/sw_vers -productVersion)，帳號 $ME（管理員），已有 Xcode 命令列工具"
+
+# 先編譯感測小幫手並自我測試（還沒動到任何系統設定）。失敗的話就停在這裡。
+/bin/mkdir -p -- $LOG_DIR || die "無法建立 $LOG_DIR"
+BUILD_LOG="$LOG_DIR/tawatch-build.log"
+HELPER_TMP=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/tawatch.XXXXXX") || die "無法建立暫存檔。"
+if ! /usr/bin/xcrun cc -O2 -Wall -Wextra -fobjc-arc -framework AppKit -framework IOKit -framework CoreGraphics \
+       -o $HELPER_TMP $SRC_DIR/src/tawatch.m 2>$BUILD_LOG; then
+  /bin/rm -f -- $HELPER_TMP
+  die "感測小幫手編譯失敗（原因見 ~/Library/Logs/TermAwake/tawatch-build.log）。除了這份編譯紀錄，沒有任何東西被修改。"
+fi
+SELFTEST=$($HELPER_TMP --once --apps Terminal 2>>$BUILD_LOG)
+if [[ $SELFTEST != "S1 "*" therm="* ]]; then
+  /bin/rm -f -- $HELPER_TMP
+  die "感測小幫手自我測試失敗（輸出：${SELFTEST:-沒有}）。除了編譯紀錄（~/Library/Logs/TermAwake/tawatch-build.log），沒有任何東西被修改。"
+fi
+ok "感測小幫手：編譯並通過自我測試（${SELFTEST#*app=Terminal }）"
 
 # ---- 1. 判斷要監視哪個 App ------------------------------------------------------
 step 1 "判斷你用的是哪個終端機 App"
@@ -150,15 +184,11 @@ fi
 ok "監視：$APPS（$WHY）"
 [[ -z $APP_ARG ]] && info "想改成別的 App：./install.sh --app iTerm2"
 
-if [[ -n $BATT_ARG ]]; then
-  [[ $BATT_ARG == <0-100> ]] || die "--battery 要是 0 到 100 的數字"
-  BATTERY_MIN=$(( 10#$BATT_ARG ))
-else
-  BATTERY_MIN=$(config_value BATTERY_MIN)
-  [[ $BATTERY_MIN == <0-100> ]] || BATTERY_MIN=20
+OLD_BATT=$(config_value BATTERY_MIN)
+if [[ -z $BATT_ARG && $OLD_BATT == <0-4> ]]; then
+  warn "你之前的設定 BATTERY_MIN=$OLD_BATT 低於 1.3 版允許的最低值，改成 5（電池可能直接用到斷電，太危險）"
+  BATT_ARG=5
 fi
-INTERVAL=$(config_value INTERVAL)
-[[ $INTERVAL == <1-300> ]] || INTERVAL=5
 
 # ---- 2. 免密碼規則（唯一需要密碼的步驟，所以放最前面）-----------------------
 step 2 "設定「只有兩條指令」可以免密碼"
@@ -193,8 +223,8 @@ EOF
 )
   # 檔名刻意不含「.」：macOS 的 sudo 會「忽略」sudoers.d 裡檔名有點的檔案（例如 termawake.conf）
   run_as_root "$ROOT_SCRIPT" "TermAwake 要建立免密碼規則：只允許 pmset -a disablesleep 0 和 1 這兩條指令。" ||
-    die "沒有完成（可能是取消了密碼視窗，或密碼錯誤）。到目前為止沒有任何東西被修改，可以再執行一次 ./install.sh。"
-  sudoers_works || die "規則寫進去了，但測試時還是需要密碼。請把畫面上的訊息貼到 GitHub Issues。"
+    { /bin/rm -f -- $HELPER_TMP; die "沒有完成（可能是取消了密碼視窗，或密碼錯誤）。到目前為止沒有任何東西被修改，可以再執行一次 ./install.sh。"; }
+  sudoers_works || { /bin/rm -f -- $HELPER_TMP; die "規則寫進去了，但測試時還是需要密碼。請把畫面上的訊息貼到 GitHub Issues。"; }
   ok "已建立 $SUDOERS_FILE（擁有者 root:wheel、權限 0440、通過 visudo 語法檢查）"
 fi
 /usr/bin/sudo -k 2>/dev/null
@@ -206,46 +236,13 @@ fi
 
 # ---- 3. 安裝檔案 ----------------------------------------------------------------
 step 3 "安裝程式檔案"
-/bin/mkdir -p -- $APP_DIR $LOG_DIR ${LINK:h} ${PLIST:h} || die "無法建立資料夾。"
+/bin/mkdir -p -- $APP_DIR ${LINK:h} ${PLIST:h} || die "無法建立資料夾。"
 install_file $SRC_DIR/bin/termawake $BIN 755 || die "無法複製程式到 $APP_DIR"
 install_file $SRC_DIR/uninstall.sh "$APP_DIR/uninstall.sh" 755 || die "無法複製移除程式。"
-ok "程式：~/Library/Application Support/TermAwake/termawake"
+install_file $HELPER_TMP $HELPER 755 || die "無法安裝感測小幫手。"
+/bin/rm -f -- $HELPER_TMP "$APP_DIR/lidwatch" "$LOG_DIR/lidwatch-build.log"   # 1.2 版的蓋子小幫手已經併進 tawatch
+ok "程式：~/Library/Application Support/TermAwake/（termawake、tawatch）"
 info "（不放在桌面或「文件」：macOS 會擋背景程式讀取那些資料夾）"
-
-# 蓋子事件小幫手（src/lidwatch.c）：合上蓋子會立刻關螢幕，平常完全不用輪詢。
-# 需要 Xcode 命令列工具才能編譯；沒有的話退回「每 INTERVAL 秒檢查一次蓋子」。
-# 先用 xcode-select -p 檢查：直接呼叫 cc 在沒裝工具的電腦上會跳出安裝視窗。
-LIDWATCH="$APP_DIR/lidwatch"
-LW_LOG="$LOG_DIR/lidwatch-build.log"
-if [[ ! -r $SRC_DIR/src/lidwatch.c ]]; then
-  /bin/rm -f -- $LIDWATCH
-  warn "找不到 src/lidwatch.c → 合上蓋子後最多 ${INTERVAL} 秒才關螢幕"
-elif ! /usr/bin/xcode-select -p >/dev/null 2>&1; then
-  /bin/rm -f -- $LIDWATCH
-  warn "沒有 Xcode 命令列工具 → 合上蓋子後最多 ${INTERVAL} 秒才關螢幕"
-  info "想要合蓋立刻關螢幕：執行 xcode-select --install，裝好後重新執行 ./install.sh"
-else
-  LW_TMP="$LIDWATCH.tmp.$$"
-  if /usr/bin/xcrun cc -O2 -Wall -Wextra -framework IOKit -framework CoreFoundation \
-       -o $LW_TMP $SRC_DIR/src/lidwatch.c 2>$LW_LOG; then
-    # 自我測試：要能成功向系統登記並持續等待（登記失敗的話會馬上自己結束）
-    $LW_TMP >/dev/null 2>>$LW_LOG &
-    lw_pid=$!
-    /bin/sleep 1
-    if kill -0 $lw_pid 2>/dev/null; then
-      kill $lw_pid 2>/dev/null; wait $lw_pid 2>/dev/null
-      /bin/mv -f -- $LW_TMP $LIDWATCH
-      ok "蓋子事件小幫手：已編譯並通過自我測試（合上蓋子會立刻關螢幕，平常不用輪詢）"
-    else
-      wait $lw_pid 2>/dev/null
-      /bin/rm -f -- $LW_TMP $LIDWATCH
-      warn "蓋子事件小幫手無法啟動 → 合上蓋子後最多 ${INTERVAL} 秒才關螢幕（原因見 ~/Library/Logs/TermAwake/lidwatch-build.log）"
-    fi
-  else
-    /bin/rm -f -- $LW_TMP $LIDWATCH
-    warn "蓋子事件小幫手編譯失敗 → 合上蓋子後最多 ${INTERVAL} 秒才關螢幕（原因見 ~/Library/Logs/TermAwake/lidwatch-build.log）"
-  fi
-fi
 
 if [[ -e $LINK && ! -L $LINK ]]; then
   warn "$LINK 已經有別的檔案，不覆蓋它。請改用完整路徑執行 termawake。"
@@ -253,22 +250,20 @@ else
   /bin/ln -sfn -- $BIN $LINK && ok "指令：termawake（捷徑在 ~/.local/bin/termawake）"
 fi
 
+# 設定檔：保留你原本的值，補上新的項目（每一項都有說明和建議值）
 CONFIG_TMP="$CONFIG.tmp.$$"
-cat > $CONFIG_TMP <<EOF
-# TermAwake 設定檔 —— 改完存檔，幾秒內就會自動生效（不用重開機）
-# 以 # 開頭的是說明文字，不會被讀取。
-
-# 要監視的終端機 App（程序名稱）：Terminal 或 iTerm2；兩個都要就寫成 Terminal iTerm2
-APPS=$APPS
-
-# 用電池時，電量「低於」這個百分比就恢復正常睡眠（0 到 100；0 = 關閉低電量保護）
-BATTERY_MIN=$BATTERY_MIN
-
-# 每幾秒檢查一次（1 到 300）
-INTERVAL=$INTERVAL
-EOF
-/bin/mv -f -- $CONFIG_TMP $CONFIG || die "無法寫入設定檔。"
-ok "設定：監視 $APPS、電池低於 ${BATTERY_MIN}% 恢復睡眠、每 ${INTERVAL} 秒檢查"
+TPL_ARGS=("APPS=$APPS")
+[[ -n $BATT_ARG ]] && TPL_ARGS+=("BATTERY_MIN=$(( 10#$BATT_ARG ))")
+if TERMAWAKE_STATE_DIR=$APP_DIR TERMAWAKE_LOG_DIR=$LOG_DIR /bin/zsh -f $BIN _config-template $TPL_ARGS > $CONFIG_TMP &&
+   [[ -s $CONFIG_TMP ]]; then
+  /bin/mv -f -- $CONFIG_TMP $CONFIG || die "無法寫入設定檔。"
+else
+  /bin/rm -f -- $CONFIG_TMP
+  die "無法產生設定檔。"
+fi
+BATTERY_MIN=$(config_value BATTERY_MIN)
+[[ -n $(config_value INTERVAL) ]] && info "舊版的 INTERVAL 已經移除（1.3 版改成事件通知，不再定時檢查）"
+ok "設定：監視 $APPS、電池低於 ${BATTERY_MIN}% 恢復睡眠（其他項目：termawake config）"
 
 # ---- 4. 設定登入時自動啟動（launchd）--------------------------------------------
 step 4 "設定監視程式（登入時自動啟動、當掉自動重開）"
@@ -325,16 +320,16 @@ ok "已載入 launchd 服務：$LABEL"
 # ---- 5. 確認 --------------------------------------------------------------------
 step 5 "確認是否生效"
 for i in {1..40}; do
-  [[ -r $STATE_FILE && $(<$STATE_FILE) != "" ]] && break
+  if [[ -r $STATE_FILE ]]; then st=("${(@f)$(<$STATE_FILE)}"); [[ ${st[1]-} != (|starting) ]] && break; fi
   /bin/sleep 0.25
 done
 /bin/zsh -f $BIN status
 
 print -r -- "🎉 安裝完成！以後什麼都不用做："
-print -r -- "   打開 $APPS → 幾秒內自動防睡眠；完全結束 $APPS（⌘Q）→ 自動恢復原本的睡眠設定。"
+print -r -- "   打開 $APPS → 立刻自動防睡眠；完全結束 $APPS（⌘Q）→ 立刻恢復原本的睡眠設定。"
 print -r -- ""
 print -r -- "   常用指令：termawake（看狀態）、termawake pause（暫停）、termawake resume（恢復）"
-print -r -- "   完全移除：termawake uninstall"
+print -r -- "   檢查一切是否正常：termawake doctor　　看設定：termawake config　　完全移除：termawake uninstall"
 if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
   print -r -- ""
   warn "~/.local/bin 不在你的 PATH 裡，所以暫時無法直接輸入 termawake。"
