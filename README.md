@@ -1,690 +1,548 @@
 # TermAwake
 
-> **只要 Terminal 開著，MacBook 合上蓋子也不會睡著；Terminal 一關，一切自動恢復原狀。**
->
-> Keep your Mac awake — even with the lid closed — while Terminal is open. Everything is restored automatically when Terminal quits. Event-driven (no polling), with battery, thermal and Low Power Mode safety nets.
+> **只要 Terminal 開著，MacBook 合上蓋子也不會睡；Terminal 一關，立刻恢復原本的睡眠行為。**
+> 完全由事件驅動、不輪詢，並補上 `SleepDisabled` 擋掉的過熱、低電量安全網。
 
-- [這是什麼？](#這是什麼)
-- [安裝（3 步驟）](#安裝)
-- [日常使用](#日常使用)
-- [使用前一定要知道的事](#使用前一定要知道的事)
-- [怎麼確認它有效？](#怎麼確認它有效)
-- [設定](#設定) ・ [移除](#移除) ・ [安全性](#安全性) ・ [運作原理](#運作原理)
-- [開發過程：為什麼做、踩了哪些坑](#開發過程)
-- [常見問題](#常見問題)
+![platform](https://img.shields.io/badge/macOS-Apple%20Silicon-black) ![license](https://img.shields.io/badge/license-MIT-blue)
+
+**一般使用者請直接看 → [使用指南 docs/USER_GUIDE.md](docs/USER_GUIDE.md)**（一步一步的安裝、驗證、設定、常見問題）。這份 README 是工程文件：說明問題怎麼定義、為什麼這樣設計、怎麼證明它是對的。
 
 ---
 
-## 這是什麼？
+## Abstract
 
-MacBook 有個習慣：**蓋子一合上就去睡覺**。
-睡著的時候，所有程式都會暫停：Claude Code 寫到一半的程式、正在下載的檔案、跑到一半的編譯，全部停住，網路也會斷。
+TermAwake keeps a MacBook awake — including with the lid closed, on battery and without an external display — while a terminal application is running, and restores normal sleep the moment it is no longer needed. On Apple Silicon the only reliable lever is the kernel's global `SleepDisabled` flag (`pmset -a disablesleep`), which also suppresses macOS's own thermal- and power-emergency sleep; TermAwake therefore treats compensating for those side effects as a first-class requirement. The design separates an unprivileged, fully event-driven sensor (`tawatch`, Objective-C) from a single decision-maker and actuator (a zsh state machine) that alone may toggle the flag through a two-command `sudoers` rule. Crash consistency comes from a write-ahead marker protocol plus launchd supervision. On a MacBook Air (M5, macOS 26.6), lid-close-to-display-off latency is 58 ms (1.22 s in v1.2), app-quit-to-release 28 ms, and steady-state overhead is 0.056 ms of CPU per second with 0.02 wake-ups per second (≈4 µW of CPU energy), a 116× reduction. Correctness is checked by 165 scenario tests against a simulated environment and by mutation testing (9 of 10 mutants killed).
 
-TermAwake 就像一個「顧門的小幫手」，在背景幫你看著：
+## 摘要
 
-- 👀 **Terminal 有沒有開著？** macOS 一有變化就會通知它，它不用一直去問。
-- ☕ 有開 → 叫 Mac 不准睡。合上蓋子也照樣跑，只是螢幕會關掉。
-- 😴 Terminal **完全結束** → 立刻把設定改回原本的樣子，Mac 恢復正常睡覺。
-- 🛟 **安全網**：遇到下面這些情況，不管 Terminal 有沒有開，都讓 Mac 正常睡覺：
-  - 🪫 用電池而且電量**低於 20%**
-  - 🌡 Mac **太熱**
-  - 🔋 用電池而且開了**低耗電模式**
-
-| 情況 | Mac 會怎樣 |
-|---|---|
-| Terminal 開著，合上蓋子 | ✅ 繼續跑：程式、網路照常，只有螢幕關掉 |
-| Terminal 完全結束（按 `⌘Q`） | 😴 立刻恢復正常：合上蓋子就睡 |
-| 用電池，電量低於 20% | 🪫 恢復正常；如果蓋子已經合著，會**馬上**讓 Mac 睡 |
-| Mac 太熱（溫度壓力達到「重度」） | 🌡 恢復正常；蓋子合著就**馬上**睡；降溫 5 分鐘後自動恢復 |
-| 用電池又開了低耗電模式 | 🔋 恢復正常；接上電源或關掉低耗電模式後自動恢復 |
-| 輸入 `termawake pause` | ⏸ 暫停：Mac 正常睡，直到 Terminal 完全結束 |
+TermAwake 解決的問題：MacBook 在合蓋、用電池、沒接外接螢幕時，一定會進入睡眠，讓 Claude Code 這類長時間工作中斷。在 Apple Silicon 上，唯一可靠的開關是核心的 `SleepDisabled`。但它同時會擋掉 macOS 自己的過熱緊急睡眠與低電量緊急睡眠，所以本專案把「補回這些安全網」當成和「不睡」同等級的需求。架構上把**感測**（無權限、完全事件驅動的 Objective-C 小程式）和**決策／執行**（唯一能改設定的 zsh 狀態機）分開。當機一致性由「先寫標記、再改設定」的協定和 launchd 監督保證。實測：合蓋到關螢幕 58 ms、結束 Terminal 到恢復睡眠 28 ms、常駐成本每秒 0.056 ms CPU。正確性由 165 項模擬情境測試與突變測試（10 個突變抓到 9 個）驗證。
 
 ---
 
-## 安裝
+## 目錄
 
-### 第 1 步：打開 Terminal
+0. [快速上手](#0-快速上手)
+1. [問題定義與需求](#1-問題定義與需求)
+2. [背景：macOS 怎麼決定合蓋要不要睡](#2-背景macos-怎麼決定合蓋要不要睡)
+3. [相關工作](#3-相關工作)
+4. [設計決策](#4-設計決策)
+5. [系統設計](#5-系統設計)
+6. [實作](#6-實作)
+7. [評估](#7-評估)
+8. [限制與效度威脅](#8-限制與效度威脅)
+9. [工程紀錄：踩過的坑](#9-工程紀錄踩過的坑)
+10. [未來工作](#10-未來工作)
+11. [專案結構、參考資料、授權](#11-專案結構參考資料授權)
 
-按 `⌘ + 空白鍵`，輸入 `Terminal`，按 Enter。
+---
 
-### 第 2 步：下載並安裝
+## 0. 快速上手
 
-把下面四行**整段複製**，貼到 Terminal，按 Enter：
+**需求**：macOS（Apple Silicon，在 macOS 26.6 測試）、管理員帳號、Xcode 命令列工具（`xcode-select --install`；`git clone` 本身也需要）。
 
 ```bash
-cd ~/Downloads
 git clone https://github.com/Jhongwe1/TermAwake.git
 cd TermAwake
-./install.sh
+./install.sh          # 會問一次 Mac 登入密碼（建立只允許兩條指令的免密碼規則）
+termawake doctor      # 健康檢查
 ```
 
-> 💡 如果跳出「需要安裝命令列開發者工具」的視窗：按「安裝」，等它裝完（幾分鐘），再貼一次上面四行。
-> TermAwake 需要這個免費工具，在你的電腦上編譯一個小程式（感測小幫手 `tawatch`）。
->
-> 💡 不想用 git？在這個網頁按綠色的 **Code → Download ZIP**，解壓縮後在 Terminal 輸入：
-> `cd ~/Downloads/TermAwake-main && zsh install.sh`
-> （沒有命令列開發者工具的話，安裝程式會告訴你怎麼裝，而且在那之前什麼都不會改。）
-
-### 第 3 步：輸入密碼
-
-安裝到一半會請你輸入 **Mac 的登入密碼**（就是開機時輸入的那組）。
-
-- 在 Terminal 裡打密碼時，**畫面不會出現任何字**。這是正常的，打完按 Enter 就好。
-- 為什麼需要密碼？請看[安全性](#安全性)。只有安裝和移除時需要，平常不用。
-
-看到 `🎉 安裝完成！` 就好了。以後**什麼都不用做**：打開 Terminal 就會自動生效。
-
-> 安裝程式會自動判斷你用的是 Terminal 還是 iTerm2。用 iTerm2 的話也可以直接指定：`./install.sh --app iTerm2`
->
-> 從舊版升級：一樣執行 `./install.sh`。你原本的設定會保留，新的設定項目會自動加上預設值和說明。
-
----
-
-## 日常使用
-
-基本上你什麼都不用做。想看看它現在在做什麼，就在 Terminal 輸入：
-
-```bash
-termawake
-```
-
-會看到類似這樣的畫面：
-
-```
-  ✅ 防睡眠生效中：Mac 不會進入系統睡眠，合上蓋子也會繼續跑（蓋子合上時螢幕會關掉）
-
-  監視程式    執行中（PID 763；登入時自動啟動，當掉會自動重開）
-  感測小幫手  正常（等 macOS 的事件通知，平常不佔 CPU）
-  監視對象    Terminal：開著
-  電源        電池 81%，使用電池中（低於 20% 會自動恢復睡眠）
-  溫度        正常（等級 0；達到 2 會自動恢復睡眠）
-  低耗電模式  關（用電池時開啟會恢復睡眠）
-  蓋子        打開（外接螢幕 0 台）
-  暫停        否
-  系統設定    SleepDisabled = 1（TermAwake 設的；不需要時會自動改回 0）
-  免密碼規則  已安裝（/etc/sudoers.d/termawake）
-```
-
-### 所有指令
-
-| 指令 | 做什麼 |
+| 指令 | 用途 |
 |---|---|
-| `termawake` | 看目前狀態 |
-| `termawake pause` | **暫停**：讓 Mac 可以正常睡（例如要把電腦收進包包時） |
-| `termawake resume` | 取消暫停 |
-| `termawake log` | 看最近的紀錄（什麼時候啟用、什麼時候恢復、為什麼） |
-| `termawake config` | 看目前的設定 |
-| `termawake doctor` | **健康檢查**：一次檢查所有東西是否正常（只讀取，不會改任何設定） |
-| `termawake restore` | 緊急：立刻恢復正常睡眠 |
-| `termawake uninstall` | 完全移除 |
+| `termawake` | 目前狀態（感測值、判斷結果、原因） |
+| `termawake pause` / `resume` | 暫停／恢復（暫停在 Terminal 結束或重開機後自動解除） |
+| `termawake doctor` | 唯讀健康檢查，結束碼 0／1／2 |
+| `termawake config` | 目前設定與被修正過的值 |
+| `termawake log [-f]` | 決策紀錄 |
+| `termawake restore` | 緊急：立刻 `SleepDisabled=0` 並暫停 |
+| `termawake uninstall` | 完整移除 |
 
-### 想讓 Mac 睡覺，但不想關掉 Terminal？
-
-```bash
-termawake pause
-```
-
-然後合上蓋子，Mac 就會正常睡。
-暫停會在 Terminal 完全結束後自動解除；想馬上恢復就輸入 `termawake resume`。
+設定檔在 `~/Library/Application Support/TermAwake/config`，共 15 項，每一項都附說明、範圍、預設值和建議值，存檔即生效（[§6.3](#63-設定介面)）。
 
 ---
 
-## 使用前一定要知道的事
+## 1. 問題定義與需求
 
-1. **收進包包前，先 `termawake pause`，或把 Terminal 完全結束（`⌘Q`）。**
-   Terminal 開著時 Mac 不會睡，放在包包裡會一直耗電、發熱。1.3 版有過熱保護（太熱就讓 Mac 睡），但包包裡散熱很差，MacBook Air 又沒有風扇，最好不要依賴它。常把 Mac 放包包的話，可以在設定裡打開[合蓋閒置](#設定)（`IDLE_MINUTES=30`）。
-2. **只關視窗不等於關掉 Terminal。**
-   按視窗左上角紅色的 ✕ 只會關掉視窗，Terminal 其實還開著（Dock 上的圖示下面還有一個小點）。要按 `⌘Q` 才是完全結束。
-3. **Terminal 開著的時候，蘋果選單裡的「睡眠」也會沒有作用。**
-   這是 macOS 的設計：這個開關是整台電腦共用的。想睡就先 `termawake pause`。
-4. **合上蓋子時，螢幕由 TermAwake 負責關掉。** 擋住睡眠的時候，macOS 自己**不會**在合蓋時關螢幕（詳見[開發過程第 10 點](#10-合上蓋子螢幕卻還亮著實際使用才發現)），所以 TermAwake 一收到「蓋子合上」的通知就關螢幕。接著外接螢幕（桌面模式）時不會去動螢幕。
-5. **合上蓋子後，多久會鎖定？** 平常合蓋時 Mac 會睡，打開要輸入密碼；擋住睡眠以後，鎖定改由「螢幕關閉後多久要求密碼」這個設定決定。如果它是 5 分鐘，合蓋後 5 分鐘內打開就**不用密碼**。建議改成「立即」：**系統設定 → 鎖定畫面 →「螢幕保護程式啟動或顯示器關閉後要求密碼」→ 立即**（實際名稱以你系統上的中文為準）。`termawake doctor` 會幫你檢查這一項。
+### 1.1 動機
 
----
+AI 程式代理（Claude Code 等）一次工作常常要幾分鐘到幾小時。使用者希望可以合上蓋子帶著走，或是蓋著放在桌上、用手機遠端控制，讓工作繼續跑。macOS 的預設行為是合蓋就睡，所有程序和網路都會停。
 
-## 怎麼確認它有效？
+### 1.2 為什麼現有機制不夠
 
-### 測試 1：健康檢查（最快）
+- **`caffeinate`／IOPMAssertion 擋不住合蓋。** xnu 判斷合蓋要不要睡的函式完全不看 assertion：
+  `shouldSleepOnClamshellClosed() = !clamshellDisabled && !(desktopMode && acAdaptorConnected) && !clamshellSleepDisableMask`（`IOPMrootDomain.cpp:4461-4471`）。
+  只有「接外接螢幕＋接電源」（desktop mode）才不睡。
+- **`SleepDisabled` 擋得住，但是一把大鎚。** 它在 `checkSystemSleepAllowed()` 裡讓**所有** `privateSleepSystem()` 都失敗（`:7666`, `:7679`），包括過熱緊急睡眠（`:8672-8674`）和部分的低電量緊急睡眠（`:8695-8717`）。它還會寫進偏好檔，開機時由 powerd 重新套用（`PMSettings.m:1162, 1330-1347`）。此外，`man pmset` 完全沒有提到 `disablesleep`，屬於沒有正式文件的介面。
 
-```bash
-termawake doctor
-```
+所以真正的問題不是「怎麼不睡」，而是「**怎麼安全地使用一個會關掉所有安全網的開關**」。
 
-會逐項檢查：監視程式、感測小幫手、免密碼規則、睡眠設定是否一致、有沒有其他同類工具在搶同一個開關、溫度、螢幕鎖定、FileVault、最近的錯誤。最後一行是 `結果：全部正常。` 就對了（有 ⚠️ 的項目會告訴你怎麼處理）。
+### 1.3 需求
 
-### 測試 2：合上蓋子測試（最重要的一個）
-
-1. 在 Terminal 貼上這行，它會每 5 秒印一次現在的時間：
-   ```bash
-   while true; do date '+%H:%M:%S'; sleep 5; done
-   ```
-2. 合上蓋子，等 2～3 分鐘。
-3. 打開蓋子，看畫面上的時間：**每一行都應該相差大約 5 秒**。如果中間突然跳了好幾分鐘，就代表剛剛睡著了。
-4. 按 `Ctrl + C` 停止。
-
-也可以直接看系統的睡眠紀錄，確認剛剛那段時間沒有 `Sleep`：
-
-```bash
-pmset -g log | grep -E ' (Sleep|Wake) ' | tail -5
-```
-
-<details>
-<summary><b>進階版：同時檢查「螢幕有沒有關」、網路、耗電</b>（整段貼進一個新的 Terminal 視窗）</summary>
-
-貼上後按 Enter，看到「合蓋測試開始」就合上蓋子，大約 3 分鐘後打開；第 4 分鐘會自動顯示結果。想測久一點，把最後一行改成 `lidtest 10`（10 分鐘）。
-
-```zsh
-lidtest() {
-  local end=$(( $(date +%s) + ${1:-4} * 60 )) last=$(date +%s) now gap lid scr net bat w slept=0 off=0 wsum=0 wn=0
-  print "\n=== 合蓋測試開始 $(date +%H:%M:%S)：現在合上蓋子，約 3 分鐘後再打開，時間到會自動出結果 ===\n"
-  while (( $(date +%s) < end )); do
-    now=$(date +%s); gap=$(( now - last )); last=$now
-    (( gap > 30 )) && { slept=1; print "⚠️  這裡中斷了 $gap 秒 → Mac 睡著過"; }
-    ioreg -r -k AppleClamshellState -d 1 | grep -q '"AppleClamshellState" = Yes' && lid=合上 || lid=打開
-    pmset -g assertions | grep -q 'Prevent sleep while display is on' && scr=亮 || { scr=關; off=1; }
-    curl -fsm 3 -o /dev/null http://captive.apple.com/hotspot-detect.html && net=通 || net=斷
-    bat=$(pmset -g batt | grep -oE '[0-9]+%' | head -1)
-    w=$(ioreg -rn AppleSmartBattery | grep -oE '"SystemLoad"=[0-9]+' | cut -d= -f2)
-    [[ $lid == 合上 && -n $w ]] && { wsum=$(( wsum + w )); wn=$(( wn + 1 )); }
-    printf '%s  蓋子:%s  螢幕:%s  網路:%s  電池:%s  整台耗電:%.1fW\n' "$(date +%H:%M:%S)" $lid $scr $net $bat $(( ${w:-0} / 1000.0 ))
-    sleep 5
-  done
-  print "\n=== 結果 ==="
-  (( slept )) && print "❌ Mac 中途睡著了（看上面 ⚠️ 的地方）" || print "✅ Mac 全程沒有睡著（每 5 秒都有紀錄）"
-  (( off )) && print "✅ 螢幕有自動關掉" || print "❓ 測試期間沒有偵測到螢幕關掉"
-  (( wn )) && printf '🔋 合上蓋子時，整台 Mac 平均耗電：%.1f W\n' $(( wsum / wn / 1000.0 ))
-  print "\n系統紀錄（最近的螢幕／睡眠事件）："
-  pmset -g log | grep -E 'Display is turned|Entering Sleep|Wake from' | tail -6 | cut -c1-90
-}
-lidtest
-```
-
-合蓋期間每一行都應該是「蓋子:合上　螢幕:關　網路:通」，而且時間每 5 秒一行、沒有跳掉。
-
-</details>
-
-### 測試 3：關掉 Terminal 會恢復嗎？
-
-1. 按 `⌘Q` 完全結束 Terminal（如果裡面有程式在跑，它會問你要不要結束）。
-2. 再打開 Terminal。
-3. 輸入 `termawake log`，應該會看到這兩行（第一行的時間就是你按 `⌘Q` 的那一秒）：
-   ```
-   RELEASE: Terminal 已經完全結束 → SleepDisabled=0（恢復正常睡眠）
-   ENGAGE: Terminal 開著，… → SleepDisabled=1（不會睡眠，合上蓋子也照跑）
-   ```
-
-### 測試 4：低電量保護（拔掉電源時才能測）
-
-1. 拔掉電源。
-2. 暫時把門檻調到 99%（比現在的電量還高）：
-   ```bash
-   sed -i '' 's/^BATTERY_MIN=.*/BATTERY_MIN=99/' ~/Library/Application\ Support/TermAwake/config
-   ```
-3. 輸入 `termawake`，應該會看到 `🪫 電量低`（存檔後立刻生效）。
-4. 記得改回來：
-   ```bash
-   sed -i '' 's/^BATTERY_MIN=.*/BATTERY_MIN=20/' ~/Library/Application\ Support/TermAwake/config
-   ```
-
-### 測試 5：低耗電模式（拔掉電源時才能測）
-
-1. 拔掉電源，從「控制中心」或「系統設定 → 電池」打開「低耗電模式」。
-2. 輸入 `termawake`，應該會看到 `🔋 使用電池又開了低耗電模式`。
-3. 關掉低耗電模式，再輸入 `termawake`，會回到 `✅ 防睡眠生效中`。
-
-### 測試 6：程式被強制砍掉，也會自己恢復
-
-```bash
-kill -9 $(cat ~/Library/Application\ Support/TermAwake/watcher.pid)
-sleep 12; termawake log 5
-```
-
-會看到 `RECOVER` 和 `ADOPT`：macOS 自動把監視程式重新打開，而且接手原本的狀態。
-
-### 過熱保護怎麼測？
-
-沒辦法安全地測：要讓 Mac 真的過熱，就得讓它長時間高溫運轉。所以過熱保護的「觸發流程」只用自動測試驗證；在你的 Mac 上能確認的是「讀得到溫度等級」：`termawake` 的「溫度」那一列，或 `termawake doctor`。
-
-### 給開發者：自動測試
-
-```bash
-zsh tests/run-tests.zsh
-```
-
-用假的 `pmset`、`sudo`、感測小幫手模擬 164 種情況（開關 Terminal、低電量、過熱、低耗電、合蓋關螢幕、外接螢幕、設定被別人改掉、`kill -9`、小幫手當掉或卡住、指令卡住、重複啟動、設定檔被亂寫……）。有編譯器的話，也會實際編譯並測試真的感測小幫手。**不會動到真正的設定，也不需要密碼。** 大約 1 分鐘跑完。
-
----
-
-## 設定
-
-設定檔在 `~/Library/Application Support/TermAwake/config`。用「文字編輯」打開：
-
-```bash
-open -e ~/Library/Application\ Support/TermAwake/config
-```
-
-改完存檔就**立刻生效**，不用重新開機。設定檔裡每一項都寫了意思、範圍、預設值和建議值；`termawake config` 可以看目前的值。填錯的值會被忽略（改用預設值），超出範圍的數字會被調到最近的合法值；`termawake config` 會列出哪些值被改了，紀錄檔（`termawake log`）裡也有。
-
-**什麼時候不睡**
-
-| 設定 | 預設 | 範圍 | 意思 | 建議 |
-|---|---|---|---|---|
-| `APPS` | `Terminal` | 程序名稱 | 要監視的 App，多個用空白隔開（例如 `Terminal iTerm2`）。App 打開或結束時立刻知道；不是 App 的程序（例如 `tmux`）也可以，結束時立刻知道、啟動時最多 `HEARTBEAT` 秒內發現 | 你實際跑 Claude Code 的終端機 |
-| `MODE` | `app` | `app`／`work` | `app` = App 開著就不睡。`work` = 只有「有程式要求保持清醒」時才不睡：Claude Code 工作中（它會自己執行 `caffeinate`），或你用 `caffeinate -i` 包住的指令；做完後過 `WORK_GRACE` 秒恢復睡眠 | `app`。會用手機遠端控制的話一定要 `app`：`work` 模式下 Claude 做完後，合著蓋子的 Mac 會睡著，手機就連不到了 |
-| `IDLE_MINUTES` | `0`（關） | 0～1440 | 只在 `MODE=app` 有效：合蓋＋用電池＋沒接外接螢幕時，連續這麼多分鐘沒有程式要求保持清醒，就讓 Mac 睡。接著電源時不受影響 | 常把 Mac 放包包就設 `30` |
-| `WORK_GRACE` | `60` | 10～3600 秒 | `MODE=work` 時，最後一個「保持清醒」的請求結束後，再等幾秒才恢復睡眠 | `60` |
-
-**安全網（任何模式都有效）**
-
-| 設定 | 預設 | 範圍 | 意思 | 建議 |
-|---|---|---|---|---|
-| `BATTERY_MIN` | `20` | 5～100 % | 用電池時，電量低於這個百分比就恢復睡眠。不能低於 5：SleepDisabled 可能連 macOS 自己的低電量睡眠也擋掉 | `20`；電池老化後調到 `25`～`30` |
-| `THERMAL_LIMIT` | `2` | 1～3 | 溫度壓力達到這個等級就恢復睡眠（1 中度、2 重度、3 嚴重）。**不能關掉**，原因見[開發過程第 15 點](#15-過熱保護為什麼不能關) | `2` |
-| `THERMAL_COOLDOWN` | `300` | 60～3600 秒 | 過熱恢復睡眠後，要連續這麼久低於門檻才重新啟用 | `300` |
-| `LOW_POWER` | `release` | `release`／`ignore` | 用電池又開了低耗電模式時：`release` = 恢復睡眠，`ignore` = 照樣不睡 | `release` |
-
-**螢幕與通知**
-
-| 設定 | 預設 | 意思 | 建議 |
-|---|---|---|---|
-| `LID_DISPLAY_OFF` | `1` | 防睡眠期間合上蓋子就立刻關螢幕（`0` = 不管，螢幕等閒置計時才關） | `1` |
-| `NOTIFY` | `1` | 出問題、或因為安全網恢復睡眠時，發 macOS 通知（`0` = 不發） | `1` |
-
-**進階（通常不用改）**
-
-| 設定 | 預設 | 範圍 | 意思 | 建議 |
-|---|---|---|---|---|
-| `HEARTBEAT` | `60` | 10～600 秒 | 感測小幫手每幾秒把全部狀態重新讀一次。平常都靠事件通知，這只是安全網：萬一漏掉事件，最多這麼久會補上；也用來確認小幫手還活著。越小越即時、越耗電 | `60` |
-| `NOTIFY_COOLDOWN` | `600` | 0～86400 秒 | 同一種通知最短間隔 | `600` |
-| `RETRY_SECONDS` | `30` | 5～3600 秒 | 啟用或恢復睡眠失敗時，隔幾秒重試（太頻繁會在系統紀錄留下一大堆 sudo 失敗） | `30` |
-| `CMD_TIMEOUT` | `5` | 1～60 秒 | 外部指令（`sudo`、`pmset`）最多等幾秒，超過就放棄 | `5` |
-| `LOG_MAX_KB` | `1024` | 64～102400 KB | 紀錄檔超過這個大小就換新檔（舊的留一份 `termawake.log.1`） | `1024` |
-
-> 從 1.2 版升級：`INTERVAL`（每幾秒檢查一次）已經不用了，因為 1.3 版改成等 macOS 的事件通知。安裝程式會自動移除它。
-
----
-
-## 移除
-
-```bash
-termawake uninstall
-```
-
-它會依序：停止監視程式 → 確認睡眠設定已經改回來 → 刪除所有檔案 → 刪除免密碼規則（會問一次密碼）。
-
-想確認移除乾淨：
-
-```bash
-pmset -g | grep SleepDisabled    # 出現 0 或沒有輸出 = 正常睡眠
-ls /etc/sudoers.d/                # 裡面不應該有 termawake
-```
-
-> 📝 **唯一的小痕跡**：只要執行過一次 `pmset -a disablesleep`，macOS 就會在系統的電源設定檔裡記下 `SleepDisabled` 這個項目。移除後它的值是 `false`（= macOS 預設的「正常睡眠」），所以 `pmset -g` 會多顯示一行 `SleepDisabled 0`，但**行為和從來沒裝過完全一樣**。
-
-<details>
-<summary>如果 <code>termawake</code> 指令不見了，手動移除的方法</summary>
-
-```bash
-launchctl bootout gui/$(id -u)/io.github.jhongwe1.termawake
-sudo pmset -a disablesleep 0
-sudo rm /etc/sudoers.d/termawake
-rm -f ~/Library/LaunchAgents/io.github.jhongwe1.termawake.plist ~/.local/bin/termawake
-rm -rf ~/Library/Application\ Support/TermAwake ~/Library/Logs/TermAwake
-```
-
-</details>
-
-### 安裝了哪些東西？
-
-| 位置 | 是什麼 |
-|---|---|
-| `~/Library/Application Support/TermAwake/` | 程式本體 `termawake`、感測小幫手 `tawatch`（安裝時用你電腦上的編譯器編譯）、設定檔、狀態檔 |
-| `~/.local/bin/termawake` | 捷徑，讓你可以直接輸入 `termawake` |
-| `~/Library/LaunchAgents/io.github.jhongwe1.termawake.plist` | 讓 macOS 登入時自動啟動監視程式 |
-| `~/Library/Logs/TermAwake/` | 紀錄檔 |
-| `/etc/sudoers.d/termawake` | 免密碼規則（只允許兩條指令） |
-
-**不會**修改你的 `~/.zshrc`、`~/.claude/settings.json` 或其他任何設定檔。
-
----
-
-## 安全性
-
-### 為什麼要密碼？
-
-要讓 Mac「合上蓋子也不睡」，唯一可靠的方法是 `pmset -a disablesleep 1`，而這需要管理員權限。
-如果每次都要你輸入密碼，就不可能自動化了。所以 TermAwake 在 `/etc/sudoers.d/termawake` 加了一條規則：
-
-```
-Cmnd_Alias TERMAWAKE_PMSET = /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1
-你的帳號 ALL = (root) NOPASSWD: TERMAWAKE_PMSET
-```
-
-### 會不會危險？
-
-- 只有這**兩條一字不差**的指令可以免密碼。`sudo pmset -a sleep 0`、`sudo pmset disablesleep 1`（少了 `-a`）、`sudo whoami`……全部照樣要密碼，安裝時也會自動驗證這一點。
-- 最壞的情況：就算電腦裡有惡意程式，它能做的也只有「讓你的 Mac 不睡覺」，拿不到其他權限。
-- 規則寫入前會先用 `visudo` 檢查語法，失敗就整個取消。（sudoers 寫壞的話，整台電腦的 `sudo` 都會不能用，所以這一步很重要。）
-- 感測小幫手 `tawatch` **沒有任何特殊權限**，而且只讀取狀態，從來不改設定。
-- **零網路**：TermAwake 不連網、不收集任何資料、沒有自動更新。
-- **不讀你的內容**：只看「程式名稱」和「有沒有程式在要求保持清醒」，不讀 prompt、不讀終端機裡的文字。
-
----
-
-## 運作原理
-
-```
- macOS 的事件通知：蓋子、電源和電量、溫度、低耗電模式、App 開關、外接螢幕、睡眠設定被改、睡醒
-        │
-        ▼
- tawatch（感測小幫手，src/tawatch.m）── 只負責「看」，平常停著等通知，不佔 CPU
-        │ 有變化就寫一行「目前狀態」，例如：app=Terminal batt=1 pct=81 lid=1 therm=0 …
-        ▼
- FIFO（具名管道，~/Library/Application Support/TermAwake/wake）
-        │
-        ▼
- 監視程式（bin/termawake run）── 唯一做決定、唯一會改設定的程式；平常不開任何子程式
-        ├─ 該禁止睡眠嗎？          → sudo -n pmset -a disablesleep 1 或 0（免密碼規則只允許這兩條）
-        ├─ 蓋子剛合上？            → pmset displaysleepnow（關螢幕）
-        └─ 恢復睡眠時蓋子合著？    → pmset sleepnow（立刻睡）
-```
-
-### 怎麼決定要不要禁止睡眠
-
-```
- Terminal 開著嗎？ ───────────── 沒有 ──► 恢復睡眠
-   │ 有
- 暫停中嗎？ ───────────────────── 是 ───► 恢復睡眠
-   │ 不是
- 太熱嗎？（溫度壓力 ≥ 2）──────── 是 ───► 恢復睡眠（降溫 5 分鐘後才會再啟用）
-   │ 不是
- 用電池而且低於 20%？ ─────────── 是 ───► 恢復睡眠（接上電源後才會再啟用）
-   │ 不是
- 用電池又開了低耗電模式？ ─────── 是 ───► 恢復睡眠
-   │ 不是
- 禁止睡眠（SleepDisabled = 1）
-   └─ 蓋子一合上：立刻關螢幕
-「恢復睡眠」時如果蓋子合著、又沒接外接螢幕 → 立刻讓 Mac 睡
-```
-
-### 安全網：就算出事，也一定會改回來
-
-| 發生什麼事 | TermAwake 怎麼處理 |
-|---|---|
-| 登出、關機、重新開機 | 收到系統的結束訊號 → 先改回來才結束 |
-| 程式本身出錯 | 結束前的收尾程式（EXIT trap）→ 先改回來 |
-| 被 `kill -9` 強制砍掉（這個沒辦法攔截） | launchd 自動重開 → 看到「標記檔」→ 收拾 |
-| 當機、斷電 | 下次登入時自動啟動 → 看到標記檔 → 收拾 |
-| 感測小幫手當掉或卡住 | 立刻重新啟動；一直失敗 → **恢復正常睡眠**（不確定的時候選安全的一邊）並發通知 |
-| `sudo`、`pmset` 卡住 | 每個外部指令都有時間上限（預設 5 秒），不會拖住監視程式 |
-| 別的程式或你自己把 SleepDisabled 改回 0 | 當成你手動覆寫 → 進入暫停、發通知，不會跟你搶 |
-| 你自己原本就設了 `SleepDisabled = 1` | 完全不碰，也不會自作主張改回 0 |
-
-「標記檔」的規則很簡單：**改設定之前先寫標記，改回來之後才刪標記**。只要看到標記，就代表上次可能沒收拾好。
-
-### 感測小幫手看的是哪些通知
-
-| 要知道的事 | 用的 macOS 通知（全部是公開介面，不需要特殊權限） |
-|---|---|
-| Terminal 開了、關了 | `NSWorkspace` 的 App 啟動／結束通知；結束另外用核心的程序結束通知 |
-| 電源、電量 | `notify(3)`：`com.apple.system.powersources.source`、`.percent`、`.lowbattery` |
-| 溫度 | `notify(3)`：`com.apple.system.thermalpressurelevel` |
-| 低耗電模式 | `NSProcessInfoPowerStateDidChangeNotification` |
-| 蓋子 | IOKit：`IOPMrootDomain` 的 `kIOPMMessageClamshellStateChange` |
-| 外接螢幕 | CoreGraphics：`CGDisplayRegisterReconfigurationCallback` |
-| SleepDisabled 被改 | `notify(3)`：`com.apple.system.powermanagement.prefschange`（`pmset` 改完設定一定會發） |
-| 有沒有程式要求保持清醒（只在 `MODE=work` 或 `IDLE_MINUTES` 打開時） | `notify(3)`：`com.apple.system.powermanagement.assertions.anychange` |
-| 設定檔被修改 | 核心的檔案變更通知（kqueue） |
-
-另外每 60 秒（`HEARTBEAT`）會把全部重新讀一次當作安全網，也讓監視程式知道小幫手還活著。
-
----
-
-## 開發過程
-
-### 為什麼要做這個？
-
-我用的是 **MacBook Air 13 吋（M5、24GB 記憶體、1TB）**，平常用 [Claude Code](https://claude.com/claude-code) 在 Terminal 裡寫程式。
-
-Claude Code 常常一跑就是好幾分鐘、甚至更久。我希望它在做事的時候，**我可以直接把蓋子合上**，讓 Claude Code 和 Terminal 裡的其他程式繼續跑。
-但 MacBook 合上蓋子就會睡，一睡就全部停了。
-
-我想要的效果是：
-
-1. 只要 Terminal 開著，合上蓋子也不睡（螢幕關掉沒關係）
-2. Terminal 完全結束後，自動恢復原本的設定
-3. 全自動，不用我手動打指令；開很多個視窗也只會有一個監視程式
-4. 用電池而且電量低於 20% 時，自動恢復正常睡眠；就算程式異常結束，也要確保設定會改回來
-5. 需要 `sudo` 的話，只開放那兩條指令免密碼
-
-### 遇到的困難和解決方法
-
-#### 1. `caffeinate` 擋不住「合上蓋子」
-
-macOS 內建的 `caffeinate` 是最常見的防睡眠工具。用 `pmset -g assertions` 查看時還發現，**Claude Code 自己就會執行 `caffeinate`**。
-但是 `caffeinate` 只能擋「閒置太久自動睡」，擋不住「合上蓋子就睡」，除非同時接著外接螢幕和電源。
-
-**解法：** 改用 `pmset -a disablesleep 1`。這是系統層級的「禁止睡眠」開關，合上蓋子也有效。代價是需要管理員權限。
-
-#### 2. 需要管理員權限，但不想每次都輸入密碼
-
-**解法：** 在 `/etc/sudoers.d/` 加一條規則，只開放「剛好那兩條」指令。過程中注意到幾個陷阱：
-
-- `sudoers.d` 資料夾裡，**檔名有「.」的檔案會被直接忽略**（例如 `termawake.conf` 根本不會生效），所以檔名取為 `termawake`。
-- sudoers 寫壞會讓**整台電腦的 `sudo` 都不能用**，所以先用 `visudo -cf` 檢查，通過了才放進去，失敗就取消。
-- 程式裡呼叫 sudo 一律加上 `-n`：規則萬一不見了，會直接失敗，而不是卡住等密碼。
-
-#### 3. 在 Terminal 裡，找不到 Terminal（`pgrep` 的陷阱）
-
-一開始用 `pgrep -x Terminal` 檢查 Terminal 有沒有開，結果 Terminal 明明開著，它卻說沒有。
-原因是 macOS 的 `pgrep`（從 FreeBSD 來的）**預設會把自己的「祖先程序」排除掉**。在 Terminal 裡執行的指令，祖先就是 Terminal，所以怎麼找都找不到。
-
-**解法：** 加上 `-a`（include ancestors）。1.3 版改由感測小幫手直接讀程序清單（規則和 `pgrep -a -x -u 你的帳號` 一樣），不再需要 `pgrep`。
-
-#### 4. 「打開 Terminal 時才啟動」這個想法有很多漏洞
-
-原本的構想是在 `~/.zshrc`（每次打開 Terminal 都會執行的設定檔）裡啟動監視程式，但仔細分析後發現：
-
-- 監視程式會變成 Terminal 的子孫 → 又會踩到上面 `pgrep` 的陷阱。
-- 關視窗時，Terminal 會跳出「要終止執行中的程序嗎？」的警告。
-- 用 `.command` 檔或不是 zsh 的 shell 打開 Terminal 時，根本不會讀 `.zshrc`。
-- 如果舊的監視程式正要結束、剛好又開了新視窗，可能會變成**沒有任何監視程式在跑**。
-
-**解法：** 改用 macOS 內建的 **launchd**（LaunchAgent）。登入時就啟動，平常不耗電；它天生保證同一時間只會有一個，當掉還會自動重開。
-對使用者來說體驗完全一樣：打開 Terminal 就生效，不用打任何指令，而且完全不用改 `.zshrc`。
-
-#### 5. 這個開關會「寫進硬碟」，重開機之後還在
-
-實測發現，`pmset -a disablesleep 1` 會寫進 `/Library/Preferences/com.apple.PowerManagement.plist`。Apple 開源的 powerd 原始碼也顯示，開機時會從這個檔案把設定重新套用（`PMSettings.m`）。（重開機後是否真的還在，目前還沒有用「先暫停、手動設定、再重開機」的方式完整實測過。）
-也就是說，萬一監視程式被強制砍掉、當機或斷電，Mac 可能從此再也不睡覺。
-
-**解法：** 「標記檔」加上多層安全網（見[運作原理](#運作原理)）。實測 `kill -9` 之後，launchd 在 **0.57 秒**內就重開了監視程式，而且直接接手，設定全程沒有中斷。
-
-#### 6. 等待中收到「關機訊號」，竟然要 30 秒才反應
-
-一開始用 zsh 內建的 `zselect -t` 來「等 5 秒」。實測發現：等待的途中收到 `TERM`（關機、登出時系統送的結束訊號），它不會馬上醒來，而是**等到時間到了才處理**。把等待時間設成 30 秒時，真的拖了 **30.02 秒**。這會拖慢關機。
-
-**解法：** 改用 FIFO（具名管道）搭配 `read -t`：收到訊號後 **0.01 秒**內就處理。
-這個 FIFO 後來變成整個程式的中樞：感測小幫手的資料、`termawake pause` 的請求，全部都從這裡送進來。
-
-#### 7. 蓋子合著時電量變低，光把設定改回來還不夠
-
-電量低於 20% 時把設定改回 0。但如果**蓋子本來就合著**，macOS 不會再收到一次「合上蓋子」的事件；再加上 Claude Code 的 `caffeinate` 擋住了閒置睡眠，Mac 就會一直醒著，直到沒電為止。（Apple 的核心原始碼也證實：改 SleepDisabled 只會設定一個變數，不會叫核心重新判斷要不要因為合蓋而睡。）
-
-**解法：** 蓋子合著、又沒有接外接螢幕時，主動執行 `pmset sleepnow` 讓它睡。系統正在關機或登出時不會做這個動作，以免干擾關機。
-
-#### 8. 第二個監視程式差點把第一個的工作關掉
-
-「同時只能有一個監視程式」是用檔案鎖做的。但如果「結束前自動收拾」的程式碼放在「拿鎖」**之前**，第二個監視程式拿不到鎖、準備離開時，會**順手把第一個設好的防睡眠關掉**。
-
-**解法：** 先拿到鎖，才設定收拾機制。自動測試裡有一項專門檢查這件事。
-
-#### 9. 其他小坑
-
-- **程式不能放在桌面**：桌面、文件、下載資料夾受 macOS 隱私保護，背景程式讀不到。所以安裝時會複製到 `~/Library/Application Support/`。
-- **`pmset -g` 的顯示方式**：這個設定從來沒被改過時，`pmset -g` 根本不會列出 `SleepDisabled`；設定過一次之後才會一直出現。程式要把「沒出現」當成 0。
-- **電量在 19%、20% 之間跳動**，會一直切換開關 → 加上「低電量鎖定」：觸發之後，要接上電源才會解除。
-- **免密碼規則壞掉時一直重試**，會在系統紀錄留下一大堆 sudo 失敗 → 失敗後改成 30 秒才重試一次。
-- **測試時不能用「複製的系統程式」假裝成 Terminal**：macOS 會直接把它砍掉（exit 137），因為系統程式有「啟動限制」（launch constraints）→ 改用假的感測資料來測試。
-
-#### 10. 合上蓋子，螢幕卻還亮著（實際使用才發現）
-
-裝好之後我實際使用時發現：**沒有 TermAwake 時，蓋子合到某個角度螢幕就會關；裝了 TermAwake 之後，合到那個角度螢幕不會關。**
-
-說明文件一開始寫著「合上蓋子時螢幕一定是關的」，但這句話其實沒有經過實際測試。查系統紀錄（`pmset -g log`）才找到原因：
-
-- 平常合上蓋子時，macOS 是在「讓 Mac 睡覺」的同時，**順便**把螢幕關掉。紀錄裡 `Clamshell Sleep`（合蓋睡眠）和 `Display is turned off`（螢幕關閉）會在同一秒出現。
-- TermAwake 擋住了睡眠，這個「順便關螢幕」也就跟著不見了。螢幕要等閒置計時（用電池 2 分鐘、接電 10 分鐘）到了才會關。
-
-**解法：** 蓋子一合上，就用 `pmset displaysleepnow` 關螢幕（這個指令不需要管理員權限）。「怎麼知道蓋子合上了」改了三次：
-
-- **1.1 版：每秒檢查一次蓋子。** 做法簡單，但耗電偏高（見第 11 點）。
-- **1.2 版：改成「等系統通知」。** 寫了一個 C 小程式 `lidwatch`，向 macOS 登記「蓋子狀態改變」的通知。實測合蓋後約 1.2 秒螢幕關掉，其中約 1 秒花在用 `system_profiler` 數外接螢幕。
-- **1.3 版：併進感測小幫手 `tawatch`。** 外接螢幕改用 CoreGraphics 直接數（每次不到 1 毫秒，不再需要 `system_profiler`），而且蓋子一動就送出完整狀態。實機量測（2026-11-10 12:32，用電池、沒接外接螢幕）：核心在 37.024 秒記錄「蓋子合上」，TermAwake 在 37.082 秒送出關螢幕的請求，**只花 58 毫秒**（1.2 版是 1.22 秒）。
-
-**學到的事：** 沒有實際測過的行為，不要寫成「一定」。
-
-#### 11. 量耗電差點量錯：`ps` 沒有把子程式算進去
-
-我問「裝了 TermAwake，正常使用時會多耗多少電？」，第一次的回答是「只佔一顆 CPU 核心的 0.08%」。這個數字是錯的：
-
-- 那是用 `ps -S` 量的。照說明它應該會把「已經結束的子程式」也算進去，但在這台 macOS 上**實測並沒有**。TermAwake 1.x 的工作幾乎都交給子程式做（`pgrep`、`pmset`、`ioreg`），所以等於只量到冰山一角。
-- 改用系統核心的資源統計（`proc_pid_rusage`，包含所有子程式）重新量，才得到正確的數字。
-
-**學到的事：** 量測工具也要驗證。用兩種不同的方法交叉比對，才發現第一種方法漏算了。
-
-#### 12. 1.3 版：從「每 5 秒檢查一次」變成「完全靠事件」
-
-1.2 版的監視程式每 5 秒醒來一次，每次開兩個子程式（`pgrep` 看 Terminal、`pmset -g batt` 看電量）。1.3 版的目標是：**沒事的時候完全不動**。
-
-做法是把「感測」和「決定」分開：
-
-- **感測**交給新的感測小幫手 `tawatch`（Objective-C，大約 490 行）。它向 macOS 訂閱所有需要的通知（見[運作原理](#感測小幫手看的是哪些通知)），平常停在那裡等，有變化才送出一行狀態。
-- **決定**留在原本的 zsh 監視程式裡（這部分有完整的自動測試）。它平常停在 FIFO 前面等，收到一行才重新判斷；連搬檔案、刪檔案都改用 zsh 內建的指令，所以平常**一個子程式都不開**。
-
-過程中實際踩到、量到的事：
-
-- **「有程式要求保持清醒」的通知，訂了卻完全收不到。** 實測 14 秒內開關了兩次 `caffeinate`，一個事件都沒有。讀 Apple 開源的 powerd 原始碼才發現：powerd 只有在「有程式先用另一個函式登記過」時才會發這個通知（`PMAssertions.c`）。登記之後就收得到了：閒置的 2 分鐘裡平均每秒 0.33 個，偶爾一口氣來好幾個，所以小幫手會把 0.25 秒內的事件合併成一次處理。
-- **「任何電源變化」的通知太吵。** 接著電源、電量沒變的 5 分鐘裡，它還是觸發了 11 次；「電量百分比改變」和「電源來源改變」這兩個通知則是 0 次。所以只訂後面兩個。
-- **SleepDisabled 被別人改掉，也能立刻知道。** `pmset` 改完設定後一定會發 `prefschange` 通知（Apple 原始碼 `IOPMEnergyPrefs.c`；實測就算設成一樣的值也會發）。但核心是 powerd 收到通知後才更新，所以小幫手會等 0.5 秒再讀。
-- **小幫手當掉要怎麼馬上知道？** 原本想用 zsh 的 `CHLD` 訊號，實測發現在等待 FIFO 的時候它根本不會觸發。改成用一個小的子 shell 包住小幫手：小幫手不管怎麼結束（包括 `kill -9`），子 shell 都會馬上寫一行 `D` 進 FIFO。自動測試裡從 `kill -9` 到重新啟動不到 0.5 秒。
-- **子 shell 會不會把收尾程式帶走？** 監視程式結束前會「改回睡眠設定」。如果子 shell 也帶著這段收尾程式，它一結束就會誤把設定改回來。實測 zsh 的子 shell 不會執行主程式的 EXIT 收尾，但保險起見，每個子 shell 開頭都明確清掉。
-- **記憶體**：小幫手用了 AppKit（為了收到 App 開關的通知），實際佔用約 2.5 MB，比 1.2 版的 `lidwatch`（約 1.5 MB）多 1 MB。
-
-#### 13. 一個從來沒有作用過的判斷
-
-1.2 版判斷「用電池」的方式，除了看 `Battery Power`，還會看 `pmset -g batt` 的輸出有沒有 `discharging`，想抓「插著電、但充電器瓦數不夠，電量還在往下掉」的情況。這次讀了 `pmset` 的原始碼才發現：只要是插著電，它印的永遠是 `AC attached; not charging`，**根本不會印 `discharging`**。所以那個判斷從來沒有作用過，自動測試測的也是一個真實世界不會出現的輸出。
-
-**解法：** 1.3 版直接讀電池的電流：插著電、沒在充電、電流卻是負的，就當成「用電池」。
-
-#### 14. Claude Code 什麼時候會擋睡眠？
-
-我想知道 Claude Code 自己的 `caffeinate` 什麼時候開、什麼時候關，所以讀了我電腦上 Claude Code（2.1.322）的程式碼：
-
-- 只有在「正在工作」時才執行 `caffeinate -i -t 300`，每 240 秒換一個新的。
-- 工作結束 30 秒後就把它關掉。
-
-也就是說，`caffeinate` 本身就是一個「Claude 正在工作」的訊號，**不用安裝任何 hook、不用改 `~/.claude/settings.json`**。1.3 版用它做了兩個選項（預設都關閉）：`MODE=work`（只有在工作時才不睡）、`IDLE_MINUTES`（合蓋用電池時，太久沒工作就睡）。這個行為是 Claude Code 內部的設計，以後的版本可能會改；`termawake doctor` 會列出目前是誰在要求保持清醒。
-
-#### 15. 過熱保護為什麼不能關
-
-讀 Apple 的核心原始碼（xnu `IOPMrootDomain.cpp`）時發現：SleepDisabled 是「所有睡眠」的總開關，連 macOS **在過熱時為了自救而進入的緊急睡眠**也會被它擋掉。所以過熱保護不是加分功能，而是把 SleepDisabled 拿走的那道安全網補回來。
-
-溫度壓力等級從 0（正常）到 4（即將緊急睡眠）。TermAwake 在等級 2（重度）就恢復睡眠；如果蓋子合著，會立刻讓 Mac 睡。之後要連續 5 分鐘低於門檻才會再啟用，避免在門檻附近一直切換。蓋子開著的時候「恢復睡眠」不會讓 Mac 馬上睡著，你正在做的事不會被打斷。
-
-#### 16. 量耗電（1.3 版）
-
-這次用的是核心的 `proc_pid_rusage`（第 6 版）。它除了 CPU 時間，還記錄每個程序的**喚醒次數**和 **CPU 能耗**（單位奈焦耳）。過程中又踩到一個坑：它的時間單位不是奈秒，而是 CPU 的計時刻度（Apple Silicon 每秒 2400 萬次），要乘上 125/3 才是奈秒。沒換算的話，數字會小 40 倍。
-
-量法：同一台 Mac（MacBook Air M5，用電池），Terminal 開著、防睡眠生效中，每組量 180 秒。1.2 版是當時正在使用的那一份；1.3 版用一份測試用的實例（假的 `sudo`／`pmset`，不會動到真正的設定，設定檔是完整說明版），兩者都用背景優先權（和 launchd 的 `ProcessType=Background` 一樣）。
-
-| 項目 | 1.2 版 | 1.3 版 |
+| # | 功能需求 | 驗收方式 |
 |---|---|---|
-| CPU 時間（監視程式＋所有子程式＋小幫手） | 每秒 6.48 毫秒 | **每秒 0.056 毫秒**（約 1/116） |
-| 喚醒 CPU 的次數 | 每秒 0.64 次 | **每秒 0.02 次**（約 1/30） |
-| 開啟的子程式 | 每 5 秒 2 個（`pgrep`、`pmset`） | **0 個** |
-| CPU 能耗（核心的計數器） | 監視程式本身 78 µW，另外還有子程式的部分（計數器不含已結束的子程式；用同樣的比例估算約 0.5 mW） | **約 4 µW**（全部，沒有子程式） |
+| FR1 | 監視的 App（預設 Terminal）在執行時，合蓋、用電池、無外接螢幕也不睡 | 實機合蓋 19 分鐘無睡眠（§7.5） |
+| FR2 | App 結束後立刻恢復；若蓋子合著且無外接螢幕，立刻睡 | ⌘Q → 28 ms 執行恢復（§7.3）；測試 §6、§8 |
+| FR3 | 防睡眠期間合蓋要關螢幕（`SleepDisabled` 會連帶擋掉合蓋關螢幕） | 實機 58 ms（§7.3） |
+| FR4 | 安全網：低電量、過熱、低耗電模式時恢復睡眠 | 測試 §4–§6、§20、§21；實機低耗電 34 ms |
+| FR5 | 當機、`kill -9`、斷電後，設定一定會被收拾 | 標記協定（§5.5）；測試 §11–§14 |
+| FR6 | 尊重使用者：暫停／恢復；不碰別人設的 `SleepDisabled`；被別人改回 0 時不搶 | 測試 §9、§15、§22；實機 DRIFT |
+| FR7 | 所有可調參數都在設定檔，附建議值；改了立即生效 | 測試 §17 |
 
-Terminal 沒開的時候也差不多：每秒 0.060 毫秒 CPU、每秒 0.02 次喚醒、約 7 µW（1.2 版這時還是每 5 秒開一次 `pgrep`）。事件驅動的程式，耗電不太會跟著狀態變。
+| # | 非功能需求 | 目標 | 結果 |
+|---|---|---|---|
+| NFR1 | 耗電 | 常駐時不輪詢、不開子程序 | 每秒 0.056 ms CPU、0.02 次喚醒（§7.4） |
+| NFR2 | 反應時間 | 合蓋到關螢幕 < 300 ms、結束 App 到恢復 < 1 s | 58 ms、28 ms |
+| NFR3 | 最小權限 | 只有兩條一字不差的 sudo 指令；感測端零權限 | 符合（§5.7） |
+| NFR4 | 隱私 | 零網路、不讀使用者內容 | 符合 |
+| NFR5 | 強健性 | 外部指令都有時間上限；不確定時選安全的一邊 | 符合（§5.6 FMEA） |
+| NFR6 | 可觀察性 | 每個決策都有原因；異常會通知 | `status`／`log`／`doctor`／通知 |
+| NFR7 | 可測試性 | 不需要密碼、不動真實設定也能測完全部邏輯 | 165 項模擬測試 |
 
-**真正安裝之後才發現的問題：** 第一次量正式安裝的版本，CPU 是每秒 0.28 毫秒，比測試實例高 5 倍。追下去發現差別在設定檔：測試實例的設定檔只有 1 行，正式安裝的是附完整說明的版本（90 行、約 6 KB）。監視程式每次醒來都會重讀設定檔，而 zsh 的 `read` 一次只讀 **1 個位元組**（zsh 5.9 原始碼 `Src/builtin.c`：`read(readfd, &cc, 1)`），所以每醒來一次就要花 **14 毫秒**（背景優先權；前景實測一行一行讀 2.7 毫秒、一次讀進 0.16 毫秒）。改成一次讀進整個檔案之後是 4 毫秒；再改成「設定檔的指紋（inode、大小、修改時間）沒變就不重讀」（感測小幫手也會在設定檔被修改時通知），每次醒來只剩 **1.35 毫秒**。上表就是修正後的數字。在那之前，我用一個小測試量出「設定檔解析只要 1 毫秒」，後來才發現那個測試寫錯了：它根本沒有載入要測的函式。是正式安裝版的實測把這兩個錯誤一起揪出來的。
+### 1.4 限制條件
 
-整台 Mac 使用中大約 3 W，合著蓋子、沒在做事時大約 1 W。1.3 版的 4 µW 只有整台的幾十萬分之一，等於量不出來。1.2 版 README 寫的「約 5 mW」是用整台耗電的放大實驗量的（誤差很大，可能差到一倍），包含了子程式和 powerd 回應查詢的成本，所以比上面的 CPU 能耗大，兩者並不矛盾。
-
-**結論：** TermAwake 自己的耗電已經可以忽略；真正耗電的是「Mac 不睡覺」這件事本身。
-
-### 怎麼驗證的？
-
-- **自動測試 164 項**：用假的 `pmset`、`sudo`、感測小幫手模擬各種情況。假的 `sudo` 會像真的 sudoers 一樣，只放行那兩條指令，程式只要多呼叫了任何一條指令，測試就會失敗。也會實際編譯感測小幫手（`-Wall -Wextra -Werror`），測試它的事件、`--once`、父程式死掉就跟著結束。
-- **突變測試**：故意把 10 個關鍵修正改回錯的寫法，看測試抓不抓得到。抓到 9 個：拿掉過熱保護、電量下限、設定被改的偵測、低電量鎖定、低耗電、失效時恢復睡眠、指令逾時、restore 保留標記、接手後的狀態。第一輪「接手後的狀態」其實沒抓到（測試只檢查設定沒變，沒檢查狀態），補強測試後才抓到。剩下 1 個抓不到：拿掉「小幫手結束時寫的 D 行」的處理。原因是 D 行本身就會叫醒監視程式，接著 `kill -0` 也會發現小幫手不在了；D 行處理只是為了消除兩者之間極小的時間差，測試沒辦法穩定重現那個瞬間。過程中也抓到一個測試本身的時間差：測試在「打開蓋子」後立刻下指令，監視程式還沒收到新狀態。已經改成每次改變狀態都等監視程式收到才繼續。
-- **實機驗證（MacBook Air M5／macOS 26.6）**：感測小幫手在這台 Mac 上讀到的電量、電源、溫度、低耗電模式、蓋子、外接螢幕、核心的 SleepDisabled 都正確；App 開關、設定檔修改、`caffeinate` 開關、`pmset` 改設定的通知都收得到；用臨時的 launchd 服務（背景優先權，和正式安裝一樣）跑，也收得到 App 開關的通知。`termawake doctor` 在真實的系統上跑過一次。1.x 版的實測（`kill -9` 0.57 秒接手、暫停 1 秒內生效、只放行兩條 sudo 指令、移除乾淨）仍然適用。
-- **實機合蓋**：1.3 版合上蓋子到送出關螢幕請求 58 毫秒（見第 10 點），合蓋期間 Mac 沒有睡著。
-- **還沒在實機上測過的**（請用上面的測試 3～5 確認）：實際按 `⌘Q` 結束 Terminal 後多快恢復睡眠（App 結束的通知本身已經用 Calculator 驗證過）、用電池時的低耗電模式觸發、背景程式發的通知會不會顯示。過熱觸發無法安全地實測。
-
-### 開發工具
-
-這個專案是我和 [Claude Code](https://claude.com/claude-code)（Anthropic 的 AI 程式助手）一起完成的：我提出需求和想法，Claude Code 負責調查系統行為、設計架構、寫程式與測試，過程中一起討論取捨。
+Apple Silicon、SIP 開啟、不使用 kernel extension、不使用 Apple 私有 entitlement、沒有 Apple Developer ID（開源、在使用者機器上從原始碼編譯）。
 
 ---
 
-## 常見問題
+## 2. 背景：macOS 怎麼決定合蓋要不要睡
 
-**Q：會很耗電嗎？**
-TermAwake 自己幾乎不耗電（數字見[開發過程第 16 點](#16-量耗電13-版)）。真正耗電的是「Mac 不睡覺」這件事本身：合著蓋子、沒在做事的 Mac 還是會用掉大約 1 W。所以不用的時候請按 `⌘Q` 關掉 Terminal，或執行 `termawake pause`；常放包包的話，打開 `IDLE_MINUTES`。
+### 2.1 決策路徑
 
-**Q：可以用在 iTerm2 嗎？**
-可以。安裝時會自動判斷，也可以直接指定：`./install.sh --app iTerm2`。
+```mermaid
+flowchart TD
+    A["蓋子合上<br/>AppleClamshellState = Yes"] --> B{"shouldSleepOnClamshellClosed()<br/>IOPMrootDomain.cpp:4461"}
+    B -->|"clamshellSleepDisableMask ≠ 0<br/>或 desktop mode + AC"| N["不睡"]
+    B -->|"要睡"| C["privateSleepSystem(Clamshell)<br/>:2899"]
+    C --> D{"checkSystemSleepAllowed()<br/>:7666"}
+    D -->|"userDisabledAllSleep<br/>（= SleepDisabled）:7679"| R["拒絕：不睡"]
+    D -->|"允許"| S["系統睡眠<br/>（順便關螢幕、鎖定）"]
+```
 
-**Q：Claude Code 跑在 Cursor 或其他編輯器的終端機裡呢？**
-把那個 App 的程序名稱加進 `APPS`（例如 `APPS=Terminal Cursor`），或改用 `MODE=work`：它看的是「有沒有程式要求保持清醒」，不管 Claude Code 跑在哪裡。
+過熱緊急睡眠（`privateSleepSystem(kIOPMSleepReasonThermalEmergency)`，`:8674`）和電力緊急時的睡眠（`kIOPMSleepReasonLowPower`，`:8713, :8717`）走的也是同一個 `privateSleepSystem()`，所以**一樣會被 `SleepDisabled` 擋掉**。電力緊急時，Apple Silicon 視情況可能改走「要求使用者空間關機」（`:8709`），但無法保證一定走這條。
 
-**Q：合上蓋子後，網路會斷嗎？**
-不會。Mac 沒有睡著，Wi-Fi 會保持連線。可以用[測試 2](#測試-2合上蓋子測試最重要的一個)自己確認。
+另外，核心收到 `SleepDisabled` 只會設定變數 `userDisabledAllSleep`（`:2055-2058`, `:8386-8389`），**不會重新判斷要不要因為合蓋而睡**。所以蓋子已經合著時把設定改回 0，Mac 不會自己睡。這就是 TermAwake 恢復時要主動 `pmset sleepnow` 的原因。
 
-**Q：我會用手機遠端控制 Claude Code，要注意什麼？**
-用預設的 `MODE=app` 就好：Terminal 開著時 Mac 一直醒著，手機隨時連得到。不要用 `MODE=work`：Claude 做完之後，合著蓋子的 Mac 會睡著，手機就連不到了。
+### 2.2 可用機制比較
 
-**Q：螢幕會一直亮著嗎？**
-不會。蓋子打開時，螢幕照你原本的設定自動關掉；蓋子合上時，TermAwake 一收到通知就關螢幕。可以用[測試 2](#測試-2合上蓋子測試最重要的一個) 的進階版親自確認。
+| 機制 | 權限 | 擋得住合蓋？ | 問題 |
+|---|---|---|---|
+| IOPMAssertion（`caffeinate`） | 無 | ❌ 只擋閒置睡眠 | — |
+| 合蓋睡眠位元（`IOConnectCallScalarMethod` selector 12，`kPMSetClamshellSleepState`） | **無**（`RootDomainUserClient.cpp:388-396, 525-529`：沒有 entitlement、沒有權限檢查） | ✅ | 和 powerd 共用同一個位元：powerd 在睡前（`pmconfigd.m:411`）、醒來後（`:436-437`）、插拔電源時（`BatteryTimeRemaining.m:917-918`）都會重新設定，**合蓋中可能被清掉而突然睡著**。這和 Amphetamine 自己的說明一致：Apple Silicon 上插拔電源會讓合蓋模式失效，所以 5.3 版改成需要管理員權限的 Power Protect |
+| `kIOPMAssertionAppliesOnLidClose` | Apple 私有 entitlement（`PMAssertions.c:2571-2576`） | ✅ | 第三方拿不到 |
+| 假螢幕轉接頭（dummy display） | 無（硬體） | 只在接電源時 | desktop mode 需要 AC |
+| **`SleepDisabled`（`pmset -a disablesleep 1`）** | root | ✅ 可靠 | 擋掉**所有**睡眠，包括緊急睡眠；會寫進偏好檔、開機後還在 |
 
-**Q：接外接螢幕（合蓋使用）會受影響嗎？**
-不會。偵測到外接螢幕時，TermAwake 不會關螢幕，也不會主動讓 Mac 睡。
+### 2.3 `SleepDisabled` 的副作用與對策
 
-**Q：重新開機之後還有效嗎？**
-有。登入後會自動啟動。
-
-**Q：我之前自己設過 `sudo pmset -a disablesleep 1`，會被改掉嗎？**
-不會。TermAwake 會發現這不是它設的，完全不碰，Terminal 關掉時也不會把它改回 0。
-
-**Q：Terminal 開著，我自己執行了 `sudo pmset -a disablesleep 0`，會怎樣？**
-TermAwake 會在幾秒內發現，當成你想讓 Mac 睡，所以進入暫停並發通知，不會跟你搶。要恢復就輸入 `termawake resume`。
-
-**Q：`kill` 掉監視程式之後，為什麼它又跑回來了？**
-這是故意的：它由 launchd 管理，當掉或被砍掉都會自動重開，以確保設定一定會被正確處理。真的想停掉就用 `termawake uninstall`。
+| 被擋掉的行為 | 後果 | TermAwake 的對策 |
+|---|---|---|
+| 合蓋睡眠 | （目的） | — |
+| 合蓋時關螢幕（平常是睡眠順便做的） | 合著蓋子螢幕還亮 | 收到合蓋事件就 `pmset displaysleepnow` |
+| 過熱緊急睡眠 | 包包裡過熱 | 溫度壓力 ≥ `THERMAL_LIMIT`（預設 2）就恢復睡眠，合蓋時立刻睡 |
+| 低電量緊急睡眠（部分路徑） | 電池用到硬斷電 | 電量下限 `BATTERY_MIN`（預設 20%，不能低於 5%） |
+| 蘋果選單的「睡眠」、閒置睡眠 | 使用者會困惑 | 文件說明；`termawake pause` |
+| 寫進偏好檔、開機後重新套用 | 當機後 Mac 可能再也不睡 | 標記協定＋登入後自動收拾（§5.5） |
+| 合蓋後的螢幕鎖定 | 改由「螢幕關閉後多久要求密碼」決定 | `doctor` 檢查鎖定延遲並提出建議 |
 
 ---
 
-## 系統需求
+## 3. 相關工作
 
-- macOS（在 macOS 26.6、MacBook Air M5 上測試；其他版本沒有測試過）
-- 管理員帳號（安裝和移除時各輸入一次密碼）
-- Xcode 命令列工具（用來在你的電腦上編譯感測小幫手；`git clone` 本身也需要它）。安裝方式：`xcode-select --install`
-- Terminal.app 或 iTerm2
+**研究方法**：開源專案直接讀原始碼；閉源軟體只做靜態檢查（`otool -L`、`nm -u`、`strings`、`codesign -d`），**不執行、不反組譯商業邏輯、不複製程式碼**；Amphetamine 本體透過同作者以 MIT 授權公開的 Amphetamine Enhancer 和官方說明推論。「廠商自述」代表未經驗證。
 
-## 檔案結構
+| 工具 | 底層機制 | 什麼時候不睡 | 偵測方式 | 安全網 | 當機收拾 | 網路 |
+|---|---|---|---|---|---|---|
+| **TermAwake 1.3** | sudoers（2 條一字不差的指令）→ `pmset` | App 執行中（預設）／有工作時（選用） | **全部事件驅動**，60 秒安全網心跳 | 電量、過熱、低耗電、設定被改、感測失效 | 標記協定＋launchd＋接手 | 無 |
+| Sleepless（OSS） | sudoers（同樣兩條） | 手動開關、1～2 小時計時 | 輪詢 | 電量 15%、低耗電 | 宣稱重開機會恢復（與 powerd 原始碼矛盾） | 無 |
+| Amphetamine（App Store） | 推論：selector 12；Apple Silicon 需額外的管理員腳本 | 十多種觸發條件 | — | 電量 | Enhancer：每 10 秒的看門狗 | 未知 |
+| Hold My Lid（付費） | SMAppService root helper（XPC）→ `pmset` | agent 工作時（hooks＋程序偵測） | 多半事件驅動 | 電量、溫度、低耗電 | 租約（lease） | 含 Aptabase 分析 SDK（靜態檢查） |
+| Hold Sleep（付費） | sudoers → `pmset` | 各 App 的 CPU／磁碟／網路＋assertion | 每幾秒取樣 | 電量 20%、低耗電 | 看門狗 | 授權與更新檢查 |
+| agent-lid-closed（OSS） | sudoers＋root helper | agent 工作時（hooks） | **每秒查兩次蓋子** | 電量 15%、溫度 | 標記＋launchd | — |
+| Adrafinil（OSS） | root helper（只開放 `setSleepBlocked`） | agent 工作時（hooks） | — | 溫度約 60°C、電量 | — | — |
+| LidAwake（OSS） | sudoers → `pmset` | 依電源政策 | — | — | 單一寫入的 worker＋標記 | 手動檢查更新 |
+| sleep-preventer（OSS） | sudoers（`disablesleep *` 萬用字元） | — | 輪詢 `ioreg` | — | 登入時對帳 | — |
+
+**學來的**：過熱與低耗電保護（Hold My Lid、Sleepless）、用 CoreGraphics 偵測外接螢幕（Hold My Lid）、電源事件通知、收拾者要能在主程式失效時運作（Amphetamine Enhancer）、把錯誤做成通知（Sleepless）、把 assertion 當成「工作中」的訊號（Hold Sleep）。
+**刻意不學的**：分析 SDK、HTTP 程序間溝通、讀取 prompt、模擬鍵盤、拿 selector 12 當主機制、sudoers 萬用字元。
+
+---
+
+## 4. 設計決策
+
+| # | 決策 | 考慮過的選項 | 選擇與理由 |
+|---|---|---|---|
+| D1 | 不睡的機制 | assertion／selector 12／`SleepDisabled`／私有 entitlement | **`SleepDisabled`**：唯一在 Apple Silicon、電池、無外接螢幕下都可靠的公開手段（§2.2）；副作用由安全網補回（§2.3） |
+| D2 | 取得 root 的方式 | SMAppService root daemon＋XPC／sudoers | **sudoers，只允許兩條一字不差的指令**。daemon＋XPC 要有 Developer ID 才能用 code-signing requirement 限制呼叫者；ad-hoc 簽章只能釘 cdhash，每次重新編譯都要重裝。sudoers 的攻擊面更小、可稽核 |
+| D3 | 程序結構 | 單一原生 daemon／感測與決策分開 | **分開**：感測（Objective-C，零權限，約 390 行程式碼）只回報事實；決策與執行（zsh，約 1,060 行程式碼）是唯一寫入者。決策邏輯可讀、可在假環境完整測試。耗電的關鍵是「不輪詢、不開子程序」，跟決策用什麼語言寫無關 |
+| D4 | 偵測方式 | 輪詢／事件 | **事件**＋每 60 秒的安全網心跳（`HEARTBEAT`）。漏掉的事件最晚在一個心跳內補上，心跳也兼做存活檢查 |
+| D5 | 「工作中」訊號（選用功能） | Claude Code hooks／CPU 取樣／assertion | **assertion**：Claude Code 只在工作時執行 `caffeinate -i`（§6.4），不必改 `~/.claude/settings.json`。限 `MODE=work` 和 `IDLE_MINUTES` 使用，預設關閉 |
+| D6 | 感測小幫手是否必要 | 可選（沒有就退回輪詢）／必要 | **必要**：兩條路徑要維護兩套邏輯和測試；`git clone` 本身就需要 Xcode 命令列工具 |
+| D7 | 不確定時怎麼辦 | 一律放開／一律維持 | **分情況**：感測小幫手失效 → 放開（硬體安全優先）。單一感測值讀不到（溫度 -1、工作 -1）→ 不因此放開，`doctor` 標成 ❌。前者是整體失明，後者是罕見的局部失效；如果局部失效也放開，等於工具失去作用 |
+| D8 | 和其他工具／使用者的衝突 | 搶回來／讓步 | **讓步**：防睡眠中被改回 0 → 當成使用者覆寫，進入暫停（DRIFT）。原本就是 1（不是自己設的）→ 永遠不碰（FOREIGN） |
+| D9 | 預設行為的變更 | 由工程判斷／由使用者決定 | 凡是影響「Mac 什麼時候睡」的預設值，都由使用者決定：`MODE=app`、`THERMAL_LIMIT=2`（不分情況）、`LOW_POWER=release` |
+
+---
+
+## 5. 系統設計
+
+### 5.1 架構
+
+```mermaid
+flowchart LR
+    subgraph SRC [macOS 事件來源]
+        K["xnu IOPMrootDomain<br/>蓋子、SleepDisabled"]
+        PD["powerd<br/>電源、溫度、低耗電、偏好設定、assertion"]
+        WS["WindowServer<br/>外接螢幕"]
+        LS["LaunchServices<br/>App 開關"]
+    end
+    K -->|"IOKit interest"| TW
+    PD -->|"notify(3)"| TW
+    WS -->|"CoreGraphics callback"| TW
+    LS -->|"NSWorkspace"| TW
+    TW["tawatch<br/>只感測、零權限"] -->|"S1 狀態行"| F[(FIFO)]
+    CLI["termawake 指令"] -->|"喚醒"| F
+    F --> W["監視程式（zsh）<br/>唯一決策者、唯一寫入者"]
+    L["launchd<br/>LaunchAgent, KeepAlive"] --> W
+    W -->|"sudo -n pmset -a disablesleep 0/1"| P["pmset → powerd → 核心"]
+    W -->|"pmset displaysleepnow / sleepnow"| P
+    W --> ST[(標記檔、狀態檔、紀錄)]
+```
+
+程序樹：`launchd → zsh 監視程式 → 包裝子 shell → tawatch`。包裝子 shell 在 `tawatch` 結束時寫一行 `D`，讓監視程式在毫秒內知道（§6.2）。
+
+### 5.2 程序間協定
+
+所有訊息都寫進同一個 FIFO（權限 600）。每行都小於 `PIPE_BUF`（512 bytes），所以多個寫入者也不會交錯。
+
+| 訊息 | 來源 | 格式 |
+|---|---|---|
+| 狀態 | tawatch | `S1 gen= pid= why= seq= app= batt= pct= lid= ext= therm= lpm= sd= work=` |
+| 小幫手結束 | 包裝子 shell | `D gen=<n> rc=<結束碼>` |
+| 喚醒 | CLI | `x` |
+
+| 欄位 | 意義 | 值 |
+|---|---|---|
+| `gen` | 小幫手世代；重新啟動後舊世代的資料一律丟棄 | 遞增整數 |
+| `why` | 觸發原因 | `start tick ping app power lid display thermal lpm prefs work config wake once` |
+| `app` | 第一個在執行的監視對象 | 程序名稱或 `-` |
+| `batt` | 用電池（含「插著電但電流為負」） | 0／1 |
+| `pct` | 電量 | 0～100、-1 = 無電池 |
+| `lid` | 蓋子 | 1 合上、0 打開、-1 無蓋子 |
+| `ext` | 外接螢幕數 | ≥ 0、-1 = 讀不到 |
+| `therm` | 溫度壓力等級（`OSThermalNotification.h`：0 正常 … 4 即將緊急睡眠） | 0～4、-1 |
+| `lpm` | 低耗電模式 | 0／1 |
+| `sd` | 核心目前的 `SleepDisabled`（`IOPMrootDomain` 屬性） | 0／1／-1 |
+| `work` | 符合條件的「保持清醒」assertion 數 | ≥ 0、-1 = 沒有追蹤 |
+
+狀態是**整份快照**（level-triggered），不是增量。所以漏掉一行、或一次讀到好幾行時，以最後一行為準即可。唯一的例外是蓋子：讀到任何 `lid≠1` 都會重設「這次合蓋已經關過螢幕」，避免「開、合」被合併成一次而漏關螢幕。
+
+### 5.3 決策函式
+
+每次醒來（收到訊息或計時器到期）都完整重新判斷，依優先順序：
+
+| 順序 | 條件 | 結果 | 鎖定（latch） |
+|---|---|---|---|
+| 0 | 感測小幫手失效 | 放開（`sensor-error`） | 恢復即解除 |
+| 0' | 還沒收到第一筆感測資料 | 不動作 | — |
+| 1 | `MODE=app`：監視對象沒在跑；`MODE=work`：沒有工作且超過 `WORK_GRACE` | 放開，順便解除暫停 | — |
+| 2 | 暫停中（只在同一次開機內有效） | 放開 | 直到 resume、App 結束或重開機 |
+| 3 | 溫度壓力 ≥ `THERMAL_LIMIT` | 放開 | 連續 `THERMAL_COOLDOWN` 秒低於門檻 |
+| 4 | 用電池且電量 < `BATTERY_MIN` | 放開 | 直到接上電源 |
+| 5 | 用電池且低耗電模式（`LOW_POWER=release`） | 放開 | — |
+| 6 | 合蓋＋用電池＋無外接螢幕＋無工作，持續 `IDLE_MINUTES` | 放開並讓 Mac 睡 | 直到開蓋或接電 |
+| — | 以上都不成立 | **禁止睡眠** | — |
+
+放開時，如果蓋子合著、沒有外接螢幕（判斷不出外接螢幕時，只有低電量和過熱才會這樣做），而且不是監視程式本身要結束（可能正在關機或登出）或感測失效，就 `pmset sleepnow`（§2.1 最後一段）。
+
+### 5.4 狀態機
+
+```mermaid
+stateDiagram-v2
+    [*] --> starting
+    starting --> engaged: 條件成立
+    starting --> released: 條件不成立
+    released --> engaged: 條件成立（先寫標記，再 disablesleep 1）
+    engaged --> released: 條件不成立（disablesleep 0 並確認後刪標記，合蓋則 sleepnow）
+    engaged --> paused: 有人把 SleepDisabled 改回 0（DRIFT）
+    paused --> engaged: termawake resume
+    released --> foreign: 想啟用時發現原本就是 1 且沒有標記
+    foreign --> released: 條件不成立（不碰設定）
+    engaged --> error_release: disablesleep 0 失敗（每 RETRY_SECONDS 重試並通知）
+    released --> error_engage: disablesleep 1 失敗（退避重試，持續 60 秒就通知）
+    engaged --> sensor_error: 小幫手連續失敗 3 次
+    sensor_error --> released: 先放開（不確定時選安全的一邊）
+```
+
+`released` 對應 `app-not-running`、`no-work`、`paused`、`thermal`、`low-battery`、`low-power`、`idle` 等原因；`termawake status` 會顯示實際原因。
+
+### 5.5 不變量與當機一致性
+
+| # | 不變量 | 如何保證 |
+|---|---|---|
+| I1 | TermAwake 設的 `SleepDisabled=1` ⇒ 標記檔存在 | 啟用：先寫標記（暫存檔＋rename，原子操作）→ `disablesleep 1` → 失敗就以 `pmset -g` 的實際值決定標記去留。恢復：`disablesleep 0` → 讀回確認是 0 → 才刪標記 |
+| I2 | 同時最多一個監視程式 | `flock`（作業系統管理，`kill -9` 也會釋放）；拿到鎖之後才設 trap，所以第二個實例離開時不會動到狀態 |
+| I3 | 監視程式活著時，只有它會改 `SleepDisabled` | `pause`／`restore` 只寫暫停檔並叫醒它；確認它不在（拿得到鎖）才直接動手。它卡住時 `restore` 仍會強制改回 0，但**保留標記**，交給它恢復後收拾 |
+| I4 | 每個外部指令都有時間上限 | `run_timeout`（`CMD_TIMEOUT`，預設 5 秒）；逾時等同失敗，走保守路徑 |
+| I5 | 不碰不是自己設的設定 | 沒有標記的 1 = FOREIGN，永遠不改 |
+
+| 當機時間點 | 重新啟動後看到的狀態 | 處理 |
+|---|---|---|
+| 寫完標記、還沒設 1 | 有標記、值 0 | 照目前條件重新判斷（RECOVER） |
+| 設成 1 之後 | 有標記、值 1 | 條件成立 → 直接接手，不切換（ADOPT）；否則恢復 |
+| 改回 0、還沒刪標記 | 有標記、值 0 | 刪標記 |
+| 斷電、核心崩潰 | 偏好檔裡是 1，開機時 powerd 重新套用 | 登入後 launchd 啟動監視程式 → 看到標記 → 收拾。開機到登入之前這段時間**不受保護**（§8） |
+
+### 5.6 失效模式與影響分析（FMEA）
+
+| 元件 | 失效模式 | 偵測 | 處置 | 驗證 |
+|---|---|---|---|---|
+| tawatch | 崩潰、被 `kill -9` | 包裝子 shell 寫 `D` 行（毫秒級） | 重新啟動；連續 3 次失敗 → `sensor-error`（放開）＋通知，之後每 `HEARTBEAT` 秒重試 | 測試 §23 |
+| tawatch | 卡住（主執行緒阻塞） | 超過 2×`HEARTBEAT`+10 秒沒回報 | SIGUSR1 ping，5 秒沒回應就重新啟動 | 測試 §23 |
+| tawatch | 啟動後不回報 | 10 秒內沒有第一筆資料 | 同上 | 測試 §23 |
+| 監視程式 | 崩潰、`kill -9` | launchd KeepAlive | 重新啟動 → 標記 → RECOVER／ADOPT | 測試 §13–§14；實機 0.57 秒（1.x） |
+| 監視程式 | 卡住 | （1.3 沒有看門狗） | `restore` 仍可用並保留標記 | 測試 §25；殘餘風險（§10） |
+| sudo／pmset | 卡住 | `run_timeout` | 砍掉、視為失敗、退避重試 | 測試 §24 |
+| sudoers | 被刪除或損壞 | 啟用或恢復失敗 | 退避重試；啟用失敗持續 60 秒、或恢復失敗 → 通知 | 測試 §16 |
+| 其他程式 | 把 1 改成 0 | `prefschange` 事件 → 核心值 0 → 再用 `pmset -g` 確認 | DRIFT：暫停＋通知 | 測試 §22；實機 < 1 秒 |
+| 其他程式 | 原本就設成 1 | 啟用時讀到 1 但沒有標記 | FOREIGN：永遠不碰 | 測試 §15 |
+| 電源 | 合蓋中電量過低 | 電量事件 | 放開＋`sleepnow` | 測試 §6 |
+| 散熱 | 合蓋中過熱 | 溫度事件 | 放開＋`sleepnow`；冷卻鎖定 | 測試 §20 |
+| 系統 | 睡眠／喚醒造成時鐘跳動 | 存活計時器可能誤判 | 先 ping，有回應就不重新啟動 | 實機：睡 3 小時 14 分後無誤判 |
+| 設定檔 | 值不合法或想夾帶指令 | 解析時驗證 | 忽略或夾到範圍內並記錄；從不執行內容 | 測試 §17 |
+| 通知 | osascript 失敗或被擋 | 時間上限 | 只記錄，不影響安全 | 實機已顯示 |
+
+### 5.7 威脅模型
+
+| 行為者 | 能力 | 能對 TermAwake 做什麼 | 評估 |
+|---|---|---|---|
+| 同一使用者的其他程序 | 讀寫使用者的檔案、FIFO、設定檔；執行 sudoers 允許的兩條指令 | 偽造感測資料、讓 Mac 不睡或睡 | 它本來就能直接執行那兩條指令，**沒有額外提權**。偽造的資料會被嚴格驗證格式，不會被執行 |
+| 其他本機使用者 | 無法寫入你的 `~/Library`、FIFO（600） | 無 | sudoers 規則綁定你的帳號 |
+| 網路 | — | 無 | 不監聽任何連線、不對外連線 |
+| 供應鏈 | — | 沒有預先編譯的執行檔；安裝時在本機從原始碼編譯 | 程式碼約 1,450 行（zsh＋Objective-C，不含註解），可以完整稽核 |
+
+sudoers 規則的強化：只允許 `/usr/bin/pmset -a disablesleep 0` 和 `… 1`（sudo 比對完整參數）；檔名不含「.」（含點的檔名會被 sudo 忽略）；寫入前後都用 `visudo -c` 驗證，失敗就整個回復；安裝時驗證其他 sudo 指令仍然需要密碼。
+
+**隱私**：只讀程序名稱、電源狀態、assertion 的擁有者；不讀終端機內容或 prompt；紀錄只寫狀態變化。
+
+---
+
+## 6. 實作
+
+### 6.1 tawatch（`src/tawatch.m`）
+
+| 事件 | API | 公開？ | 備註 |
+|---|---|---|---|
+| App 啟動／結束 | `NSWorkspaceDidLaunch/TerminateApplicationNotification` | ✅ | 只當觸發器；真正的判斷用程序表（`proc_listallpids`＋`PROC_PIDT_SHORTBSDINFO`），規則和 `pgrep -x -u $UID` 相同 |
+| 監視對象結束 | `DISPATCH_SOURCE_TYPE_PROC`（`NOTE_EXIT`） | ✅ | 不是 App 的程序（例如 `tmux`）也能即時知道 |
+| 電源、電量 | `notify(3)`：`powersources.source`、`.percent`、`.lowbattery` | ✅／名稱未列在 SDK／✅ | 實測：「任何電源變化」通知在電量不變的 5 分鐘裡觸發 11 次，`.percent`＋`.source` 是 0 次，所以用後兩個 |
+| 溫度 | `notify(3)`：`kOSThermalNotificationPressureLevelName` | ✅ | `notify_get_state` 讀等級 |
+| 低耗電模式 | `NSProcessInfoPowerStateDidChangeNotification` | ✅ | — |
+| 蓋子 | `IOServiceAddInterestNotification(IOPMrootDomain)`，`kIOPMMessageClamshellStateChange` | ✅ | 插拔電源時也會收到同樣的訊息；用快照比對過濾 |
+| 外接螢幕 | `CGDisplayRegisterReconfigurationCallback`、`CGGetOnlineDisplayList`＋`CGDisplayIsBuiltin` | ✅ | 合併 0.1 秒內的回呼；第一次 13 ms，之後 < 1 ms |
+| `SleepDisabled` 被改 | `notify(3)`：`com.apple.system.powermanagement.prefschange` | 名稱未列在 SDK | `IOPMSetSystemPowerSetting` 寫完一定會發（`IOPMEnergyPrefs.c:1659`）；核心值要等 powerd 套用，所以 0.5 秒和 2 秒後各讀一次 |
+| 保持清醒的請求 | `IOPMCopyAssertionsByProcess`＋`assertions.anychange` | 查詢 ✅／登記 ❌ | powerd 只在有人用私有 SPI `IOPMAssertionNotify` 登記後才發通知（`PMAssertions.c:4333`）；用 `dlsym` 取得，沒有就只靠心跳；合併 0.25 秒內的事件。只在 `MODE=work` 或 `IDLE_MINUTES>0` 時啟用 |
+| 設定檔 | `DISPATCH_SOURCE_TYPE_VNODE` | ✅ | 編輯器存檔常是「寫新檔再改名」→ 重新監看 |
+| 睡醒 | `NSWorkspaceDidWakeNotification` | ✅ | — |
+| 存活 | 每 `HEARTBEAT` 秒的計時器（容許 10% 合併）、SIGUSR1 | ✅ | — |
+
+「用電池」的定義：電源狀態是 `Battery Power`，或插著電、沒在充電、而且電池電流是負的（充電器瓦數不夠）。1.2 版想用 `pmset` 的 `discharging` 字樣抓後者，但 `pmset` 只在 `Battery Power` 時才印這個字（`pmset.m:2355-2372`），所以那個判斷從來沒有作用過。
+
+父程式結束：同時監看 `--parent` 指定的監視程式和直接的上一層（包裝子 shell），任一結束就跟著結束。
+
+### 6.2 監視程式（`bin/termawake`）
+
+- **事件迴圈**：`read -t <timeout> -u <FIFO>`。timeout 是所有計時器裡最早到期的那個：小幫手存活、ping、過熱冷卻、重試、工作寬限、閒置計時。不用 `zselect`，因為實測它在等待中收到 TERM 不會立刻返回（等待時間設 30 秒時拖了 30.02 秒），會拖慢關機；`read -t` 在 0.01 秒內返回。
+- **零子程序**：常駐路徑只用 zsh 內建功能：`zsh/files` 的 `zf_mv`／`zf_rm`、`$(<file)` 讀檔、`zstat`、`EPOCHREALTIME`，函式回傳值放在 `REPLY` 而不用 `$(...)`。只有狀態切換時才會執行 `sudo`、`pmset`。
+- **包裝子 shell**：`{ trap - EXIT HUP INT QUIT TERM; tawatch …; print "D gen=$gen rc=$?" } >> FIFO &`。原本想用 `CHLD` trap 偵測小幫手結束，但實測在等待 FIFO 時它不會觸發。開頭重設 trap 是防禦性的：避免子 shell 結束時誤執行主程式的收尾（把設定改回來）。
+- **`run_timeout`**：背景執行指令，另一個子 shell 用 `zselect` 計時：逾時送 TERM，1 秒後送 KILL，回傳 124。指令一結束就收掉計時器。
+- **通知**：`osascript` 的 `on run argv`，訊息以參數傳入，不會被當成程式碼執行。同一種通知 `NOTIFY_COOLDOWN` 秒內最多一次。
+
+### 6.3 設定介面
+
+設定的規格只在 `bin/termawake` 的 `CFG_SPEC` 維護一份（種類、範圍、預設值）。`install.sh` 用 `termawake _config-template` 產生附說明的設定檔，並保留舊值。不合法的值改用預設值，超出範圍的數字夾到範圍內；監視程式把原因寫進紀錄，`termawake config` 也會列出。設定檔不會被執行，只會逐行比對 `名稱=值`。
+
+| 名稱 | 預設 | 範圍 | 作用 |
+|---|---|---|---|
+| `APPS` | `Terminal` | 程序名稱 | 監視對象 |
+| `MODE` | `app` | `app`／`work` | 何時不睡 |
+| `IDLE_MINUTES` | 0 | 0～1440 | 合蓋閒置睡眠（`MODE=app`） |
+| `WORK_GRACE` | 60 | 10～3600 秒 | `MODE=work` 的寬限 |
+| `BATTERY_MIN` | 20 | 5～100 % | 低電量門檻 |
+| `THERMAL_LIMIT` | 2 | 1～3 | 過熱門檻（不能關閉） |
+| `THERMAL_COOLDOWN` | 300 | 60～3600 秒 | 過熱鎖定時間 |
+| `LOW_POWER` | `release` | `release`／`ignore` | 低耗電模式政策 |
+| `LID_DISPLAY_OFF` | 1 | 0／1 | 合蓋關螢幕 |
+| `NOTIFY` | 1 | 0／1 | 通知 |
+| `HEARTBEAT` | 60 | 10～600 秒 | 安全網心跳 |
+| `NOTIFY_COOLDOWN` | 600 | 0～86400 秒 | 通知間隔 |
+| `RETRY_SECONDS` | 30 | 5～3600 秒 | 失敗重試間隔 |
+| `CMD_TIMEOUT` | 5 | 1～60 秒 | 外部指令時間上限 |
+| `LOG_MAX_KB` | 1024 | 64～102400 | 紀錄輪替大小 |
+
+**重新讀取設定**：只在設定檔的指紋（inode、大小、修改時間、ctime）改變，或小幫手回報 `why=config` 時才重新解析。這是正式安裝後實測才發現的效能問題（§9 #10）。
+
+### 6.4 「工作中」訊號（`MODE=work`、`IDLE_MINUTES`）
+
+靜態分析本機安裝的 Claude Code 2.1.322 得到的行為：
+
+- 只在工作狀態（busy）時執行 `caffeinate -i -t 300`，每 240 秒換一個新的；離開工作狀態 30 秒後才關掉。
+- Remote Control 另外會在「不是閒置」時保持清醒：等使用者回應最多 15 分鐘，連續最多 1 小時。
+
+所以 assertion 本身就是「工作中」的訊號。計入的 assertion 種類是 `PreventUserIdleSystemSleep`、`PreventSystemSleep`，擁有者必須是你自己的 `caffeinate`，或是監視對象的子孫程序（往上追 `ppid`）。讀不到時當成在工作，安全網照常有效。這是 Claude Code 的內部行為，未來版本可能改變。
+
+### 6.5 安裝與移除
+
+`install.sh` 的流程是「**先驗證、後修改**」：檢查環境 → 編譯 `tawatch` 並自我測試（失敗就停，除了一份編譯紀錄外不改任何東西）→ 建立或驗證 sudoers → 用暫存檔＋rename 原子化安裝 → 產生設定檔（保留舊值）→ `launchctl bootout`（舊版會先把設定改回來）→ `bootstrap` → `status`。實測從 1.2 升級時，空檔約 1 秒。`uninstall.sh` 先停止監視程式（它結束前會改回設定），再確認設定、刪檔、刪 sudoers。
+
+---
+
+## 7. 評估
+
+### 7.1 測試平台與方法
+
+| 項目 | 內容 |
+|---|---|
+| 硬體 | MacBook Air 13 吋，M5（Mac17,3），24 GB |
+| 系統 | macOS 26.6（25G72），xnu-12377.161.13 |
+| 功能正確性 | 假環境：假的 `pmset`、`sudo`（只放行兩條指令）、感測小幫手（讀檔模擬事件）、通知程式；時間倍率 `TERMAWAKE_TIME_SCALE=0.05` 加速計時器 |
+| 延遲 | 統一紀錄（unified log）的毫秒時間戳記：核心、launchd、powerd、sudo |
+| 資源用量 | `proc_pid_rusage(RUSAGE_INFO_V6)`：CPU 時間（含已結束子程序）、套件喚醒＋中斷喚醒（含子程序）、`ri_energy_nj`（每個程序的 CPU 能耗）；`footprint` 量記憶體。時間單位是 mach tick（×125/3 才是奈秒） |
+| 條件 | 背景優先權（和 launchd `ProcessType=Background` 相同），同時量測以抵消系統雜訊 |
+
+### 7.2 功能正確性
+
+- **165 項情境測試**（31 節）：啟用、恢復、單一實例、低電量與鎖定、合蓋睡眠與外接螢幕、暫停與恢復、訊號處理、`kill -9` 收拾與接手、FOREIGN、sudoers 壞掉與退避、設定熱更新與注入、合蓋關螢幕、事件驅動（沒有事件時零外部指令）、過熱與冷卻、低耗電、DRIFT、小幫手崩潰與卡住、指令逾時、卡住時的 `restore`、`MODE=work`、`IDLE_MINUTES`、通知開關、真實 `tawatch` 的編譯（`-Werror`）與行為（包括設定檔連續被取代 5 次都要通知）、只用了允許的 sudo 指令、各個指令。約 60 秒跑完。
+- **突變測試**：把 10 個關鍵修正改回錯的寫法，抓到 9 個：過熱、電量下限、DRIFT、低電量鎖定、低耗電、失效時放開、指令逾時、`restore` 保留標記、接手後的狀態。最後一項第一輪其實沒抓到（測試只檢查設定沒變、沒檢查狀態），補強後才抓到。抓不到的是「拿掉 `D` 行處理」：`D` 行本身就會叫醒監視程式，接著 `kill -0` 也會發現；`D` 行處理只是消除兩者之間的時間差，測試無法穩定重現。
+- **不穩定測試**：突變測試過程中發現一項測試偶爾失敗。原因是測試改完蓋子狀態就立刻下指令，監視程式還沒收到新狀態。改成每次改變感測值都等監視程式收到才繼續，修正後連續兩次全部通過。
+
+### 7.3 延遲（實機，2026-11-10）
+
+| 動作 | 系統事件 | TermAwake 動作 | 延遲 | 1.2 版 |
+|---|---|---|---|---|
+| 合上蓋子 | 12:32:37.024 核心 `PMRD: clamshell closed` | 37.082 SkyLight 收到 displays idle 請求 | **58 ms** | 1.22 s |
+| ⌘Q 結束 Terminal | 12:55:50.473 launchd 回報結束 | 50.501 `sudo` 啟動（`disablesleep 0`） | **28 ms** | 最多 5 s（輪詢） |
+| 打開低耗電模式 | 12:55:18.564 powerd 切換 | 18.598 `sudo` 啟動 | **34 ms** | 不支援 |
+| 別人把設定改回 0 | 12:53:10.995 使用者的 `sudo` | 12:53:11 DRIFT＋通知 | **< 1 s**（設計約 0.5 s） | 不偵測 |
+
+```mermaid
+sequenceDiagram
+    participant K as xnu
+    participant T as tawatch
+    participant W as 監視程式
+    participant P as pmset
+    K->>T: kIOPMMessageClamshellStateChange（0 ms）
+    T->>W: S1 why=lid lid=1 ext=0（FIFO）
+    W->>P: displaysleepnow（52 ms 啟動）
+    P->>K: 要求關閉螢幕（58 ms）
+```
+
+### 7.4 資源用量
+
+背景優先權、Terminal 開著（防睡眠中），每組 180 秒：
+
+| 指標 | 1.2 版 | 1.3 版 |
+|---|---|---|
+| CPU（監視程式＋子程序＋小幫手） | 6.48 ms/s | **0.056 ms/s**（1/116） |
+| 喚醒次數 | 0.64 次/s | **0.02 次/s**（1/30） |
+| 開子程序 | 每 5 秒 2 個 | **0** |
+| CPU 能耗 | 監視程式本身 78 µW＋子程序（計數器不含；依比例估約 0.5 mW） | **約 4 µW**（全部） |
+| 記憶體（phys_footprint） | 監視程式 2.16 MB＋`lidwatch` 1.46 MB | 監視程式 2.3 MB＋包裝子 shell 1.1 MB＋`tawatch` 2.3～3.4 MB |
+
+Terminal 沒開時：0.060 ms/s、0.02 次/s、約 7 µW。事件驅動的程式，耗電不太會跟著狀態變。
+
+**記憶體壓力測試**：常駐程式最怕記憶體一直長。對 `tawatch` 分項施壓，每種事件各做兩輪以上：設定檔被取代 300 次（第一輪 +352 KB、第二輪 +48 KB）、assertion 事件 100 次（+208 KB、+64 KB）、App 啟動結束 15 次（+432、+32、+0 KB）、強制重讀 1,000 次（-48 KB）。每種事件都只在第一次出現時增加（AppKit 等框架的一次性初始化），之後就持平，所以不是洩漏；各種事件都遇過一次後穩定在約 3.4 MB。為了保險，每個事件處理程序都包了自己的 `@autoreleasepool`：主程式停在 `CFRunLoopRun()`，外層的 pool 永遠不會被清空。
+
+整台 Mac 使用中約 3 W、合蓋閒置約 1 W，1.3 版的常駐成本在量測上可以忽略。**真正耗電的是「Mac 不睡覺」本身**，這也是 `IDLE_MINUTES` 和 `MODE=work` 存在的理由。
+
+### 7.5 實機驗證矩陣
+
+| 情境 | 方法 | 結果 |
+|---|---|---|
+| 從 1.2 升級 | `install.sh` | ✅ 切換空檔約 1 秒；`doctor` 只剩螢幕鎖定警告 |
+| 合蓋（用電池、無外接螢幕） | 合蓋 19 分鐘＋統一紀錄 | ✅ 58 ms 關螢幕、全程沒有睡 |
+| ⌘Q 結束／重開 Terminal | 統一紀錄 | ✅ 28 ms 恢復；重開後啟用 |
+| 低耗電模式開／關（用電池） | 控制中心 | ✅ 34 ms 恢復；關閉後在同一秒內重新啟用 |
+| DRIFT | `sudo pmset -a disablesleep 0` | ✅ 暫停、**通知有顯示**；`resume` 恢復 |
+| 睡眠與喚醒 | Terminal 結束後合蓋，12:58 進入睡眠、16:12 醒來，期間 13 次 DarkWake | ✅ 醒來後事件正常，沒有誤判小幫手失效 |
+| launchd 背景環境 | 臨時 LaunchAgent（`ProcessType=Background`） | ✅ 收得到 App 開關通知 |
+| 感測讀值 | `tawatch --once` 對照系統 | ✅ 電量、電源、溫度、低耗電、蓋子、外接螢幕、核心 `SleepDisabled` |
+| `kill -9` 接手 | 1.x 實機；1.3 自動測試 | ✅ 0.57 秒（1.x） |
+| 過熱觸發 | — | ⚠️ 無法安全地實測；只有自動測試 |
+| 低電量保護 | — | ⚠️ 只有自動測試（使用指南的測試 4 可以用「把門檻調高」的方式在實機驗證） |
+| 重開機後 `SleepDisabled` 是否還在（E1） | — | ⚠️ 只有原始碼證據 |
+| `MODE=work`、`IDLE_MINUTES`、外接螢幕 | — | ⚠️ 只有自動測試 |
+
+---
+
+## 8. 限制與效度威脅
+
+- **外部效度**：只在一台 MacBook Air M5、macOS 26.6 上驗證；其他機型、其他系統版本、Intel Mac 沒有測過。
+- **未公開介面**：`pmset disablesleep` 沒有寫在 `man pmset`；`powersources.percent`、`prefschange`、`assertions.anychange` 這三個通知名稱沒有列在 SDK；`IOPMAssertionNotify` 是私有 SPI。它們都有退路：心跳每 60 秒重讀、`doctor` 會檢查，但 Apple 可能在未來版本改掉。
+- **依賴第三方行為**：`MODE=work`／`IDLE_MINUTES` 依賴 Claude Code「工作中才執行 caffeinate」的內部行為。
+- **開機到登入之間**：當機或斷電後重開機，在登入、監視程式啟動之前，偏好檔裡的 `SleepDisabled=1` 會被 powerd 套用。開了 FileVault 時，開機解鎖前可能讀不到偏好檔（❓ 未驗證）；沒開 FileVault 的機器有這段空窗。
+- **監視程式卡住**：1.3 沒有獨立的看門狗；`restore` 仍可使用。
+- **量測**：`ri_energy_nj` 只計 CPU 核心的能耗，不含 SoC fabric、記憶體和 powerd 回應查詢的成本；1.2 版子程序的能耗是估算。延遲是單次量測，沒有分布統計。
+- **權限**：sudoers 規則讓同一使用者的任何程序都能改這個開關（§5.7）。這是刻意的取捨：換成 root daemon 要有 Developer ID 才能可靠地驗證呼叫者。
+
+---
+
+## 9. 工程紀錄：踩過的坑
+
+每一項都是實際發生、有證據的事。
+
+| # | 症狀 | 根因 | 解法與證據 |
+|---|---|---|---|
+| 1 | 在 Terminal 裡 `pgrep -x Terminal` 找不到 Terminal | macOS 的 `pgrep` 預設排除自己的祖先程序 | 1.x 加 `-a`；1.3 改讀程序表 |
+| 2 | sudoers 規則寫了卻沒效 | `sudoers.d` 裡檔名含「.」的檔案會被忽略 | 檔名取為 `termawake`；`visudo -c` 驗證 |
+| 3 | 登出時要等 30 秒 | `zselect` 等待中收到 TERM 不會返回（實測 30.02 秒） | 改用 FIFO＋`read -t`（0.01 秒） |
+| 4 | 合著蓋子螢幕還亮（使用者發現；文件原本寫「一定會關」） | 平常是「睡眠順便關螢幕」，睡眠被擋就不會關 | 合蓋事件 → `displaysleepnow`。教訓：沒實測的不寫「一定」 |
+| 5 | 耗電估得太低（1.1 版原本宣稱一顆核心的 0.8%，實際約 5%） | `ps -S` 在這台 macOS 不計入已結束的子程序 | 改用 `proc_pid_rusage`；交叉比對兩種量法 |
+| 6 | 訂了 assertion 變化的通知卻收不到（14 秒、開關兩次 `caffeinate`，0 個事件） | powerd 只在有人登記後才發（`PMAssertions.c:4333`） | 用 `IOPMAssertionNotify` 登記；閒置時平均每秒 0.33 個，會爆量 → 合併 0.25 秒 |
+| 7 | 「插電但在掉電」的判斷從來沒觸發過 | `pmset` 插電時不印 `discharging`（`pmset.m:2355-2372`），測試也是用真實世界不存在的輸出 | 改看電池電流 |
+| 8 | 想用 `CHLD` trap 立刻知道小幫手結束，沒反應 | 在 `read -t` 等 FIFO 時 zsh 不執行 `CHLD` trap | 包裝子 shell 寫 `D` 行 |
+| 9 | `doctor` 顯示「狀態：e」 | zsh 對只有一行的 `${(f)…}` 取 `[1]`，會變成取第一個字元 | 先放進陣列（`"${(@f)…}"`）再取 |
+| 10 | 正式安裝後 CPU 比測試實例高 5 倍（0.28 vs 0.057 ms/s） | zsh 的 `read` 一次只讀 1 個位元組（zsh 5.9 `Src/builtin.c:6617, 6999`）；附說明的設定檔約 6 KB，每次醒來重讀要 14 ms | 一次讀進＋只挑 `名稱=值` 的行（4.3 ms）→ 指紋沒變就不重讀（1.35 ms）。我先前寫的「解析只要 1 ms」的小測試切錯字串、根本沒載入函式，是正式版的實測同時揪出這兩個錯 |
+| 11 | `proc_pid_rusage` 的 CPU 時間小 40 倍 | 單位是 mach tick，不是奈秒 | 乘上 `numer/denom`（125/3） |
+| 12 | 一項測試偶爾失敗 | 測試改完狀態就立刻下指令，監視程式還沒收到 | 改變感測值後等監視程式收到才繼續 |
+| 13 | 測試用的 `pgrep -f` 送錯訊號，殺掉包裝的 shell | `-f` 比對到命令列含路徑的父 shell | 改用 `pgrep -x` 比對程序名稱 |
+| 14 | 壓力測試：設定檔連續被取代 300 次，只收到 18 次通知 | 檔案被取代後，舊的監看就失效了，原本要等 0.5 秒才重新監看，中間的修改全部漏掉 | 立刻改監看新檔案，成功後再補送一次通知：300 次全收到。新增回歸測試（舊版：連續 5 次只收到 1 次；新版 5 次） |
+
+---
+
+## 10. 未來工作
+
+1. **看門狗**：小幫手監看監視程式的心跳，卡住時由它恢復設定（只用既有的 sudoers 指令，不增加權限）。
+2. **開機守門員**：極小的 root LaunchDaemon，開機時看到標記就恢復正常睡眠，補上「開機到登入」的空窗。
+3. **實驗**：E1 重開機持久性、E4 溫度門檻校準（無風扇機種重負載多久到等級 2）、其他機型與系統版本。
+4. **發佈**：CI（macOS runner 跑測試與 `-Werror` 編譯）、校驗碼、可重現建置。
+5. **介面**：選單列狀態圖示（只讀狀態檔、只寫 FIFO，不需權限）。
+
+---
+
+## 11. 專案結構、參考資料、授權
 
 ```
 TermAwake/
-├── README.md             說明文件（就是這份）
-├── CHANGELOG.md          版本紀錄
-├── LICENSE               授權（MIT）
-├── install.sh            安裝程式
-├── uninstall.sh          移除程式
-├── bin/termawake         監視程式 + 所有指令（zsh）
-├── src/tawatch.m         感測小幫手（Objective-C，安裝時編譯）
-└── tests/run-tests.zsh   自動測試
+├── README.md            工程文件（本文）
+├── docs/USER_GUIDE.md   使用指南（一步一步）
+├── CHANGELOG.md         版本紀錄
+├── LICENSE              MIT
+├── install.sh           安裝（先驗證、後修改）
+├── uninstall.sh         移除
+├── bin/termawake        監視程式＋所有指令（zsh，約 1,060 行程式碼）
+├── src/tawatch.m        感測小幫手（Objective-C，約 390 行程式碼，安裝時編譯）
+└── tests/run-tests.zsh  165 項情境測試
 ```
 
-## 授權
+**參考資料**（行號以 2026-11-10 的 main 分支為準）
 
-[MIT](LICENSE)
+- Apple xnu：[`iokit/Kernel/IOPMrootDomain.cpp`](https://github.com/apple-oss-distributions/xnu/blob/main/iokit/Kernel/IOPMrootDomain.cpp)（`shouldSleepOnClamshellClosed` :4461、`privateSleepSystem` :2899、`checkSystemSleepAllowed` :7666、`userDisabledAllSleep` :7679/:8388、緊急睡眠 :8672-8717）、[`RootDomainUserClient.cpp`](https://github.com/apple-oss-distributions/xnu/blob/main/iokit/Kernel/RootDomainUserClient.cpp)（selector 12 :388-396、:525-529）
+- Apple PowerManagement：[`pmconfigd/PMSettings.m`](https://github.com/apple-oss-distributions/PowerManagement/blob/main/pmconfigd/PMSettings.m)（:1162、:1330-1347）、`pmconfigd/pmconfigd.m`（:411、:436-437）、`pmconfigd/BatteryTimeRemaining.m`（:917-918）、`pmconfigd/PMAssertions.c`（:2571-2576、:4333）、`pmset/pmset.m`（:2355-2372）
+- Apple IOKitUser：[`pwr_mgt.subproj/IOPMEnergyPrefs.c`](https://github.com/apple-oss-distributions/IOKitUser/blob/main/pwr_mgt.subproj/IOPMEnergyPrefs.c)（:1622-1659）、`IOPMLibPrivate.h`（`IOPMAssertionNotify`）
+- macOS SDK：`libkern/OSThermalNotification.h`、`IOKit/ps/IOPowerSources.h`、`IOKit/pwr_mgt/IOPM.h`
+- zsh 5.9：[`Src/builtin.c`](https://github.com/zsh-users/zsh/blob/zsh-5.9/Src/builtin.c)（:6617、:6999）
+- 相關工作：[Sleepless](https://github.com/Aboudjem/Sleepless)、[Amphetamine](https://apps.apple.com/app/amphetamine/id937984704)／[Amphetamine Enhancer](https://github.com/x74353/Amphetamine-Enhancer)、[Hold My Lid](https://holdmylid.app)、[Hold Sleep](https://holdsleep.com)、[agent-lid-closed](https://github.com/Jin-hiroo/agent-lid-closed)、[LidAwake](https://github.com/TurboKach/LidAwake)、[sleep-preventer](https://github.com/stickerdaniel/sleep-preventer)、[agentawake](https://github.com/meshulga/agentawake)
+
+**開發方式**：本專案由作者與 [Claude Code](https://claude.com/claude-code) 協作完成。作者負責需求、決策與實機驗證；Claude Code 負責調查系統行為、設計、實作與測試。過程中所有影響行為的預設值都由作者決定。
+
+**授權**：[MIT](LICENSE)

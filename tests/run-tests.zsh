@@ -560,6 +560,9 @@ if /usr/bin/xcode-select -p >/dev/null 2>&1 &&
   check "啟動時印出第一行（why=start）" 'grep -q "why=start" $T/real.out'
   print 'APPS=y' >> $T/cfg-real
   check "設定檔一改就通知（why=config）" 'grep -q "why=config" $T/real.out'
+  c0=$(grep -c "why=config" $T/real.out)
+  for i in {1..5}; do print "APPS=r$i" >| $T/cfg-real.tmp; mv -f $T/cfg-real.tmp $T/cfg-real; sleep 0.05; done
+  check "設定檔連續 5 次被「取代」（編輯器存檔的方式）→ 5 次都有通知" '(( $(grep -c "why=config" $T/real.out) - c0 >= 5 ))'
   /bin/sleep 2.5 & sp=$!
   check "非 App 的程序（sleep）在下一次心跳被找到" 'grep -q "app=sleep" $T/real.out'
   wait $sp

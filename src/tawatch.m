@@ -248,9 +248,13 @@ static void emit(const char *why, BOOL force) {
     }
 }
 
+// 每個事件處理都包一個 autorelease pool：主程式停在 CFRunLoopRun()，
+// 外層的 pool 永遠不會被清空，不包的話暫時物件會一直累積
 static void refresh(const char *why) {
-    read_all();
-    emit(why, NO);
+    @autoreleasepool {
+        read_all();
+        emit(why, NO);
+    }
 }
 
 // 程序結束通知：監視對象（不管是不是 App）一結束就立刻知道
@@ -267,10 +271,12 @@ static void watch_app_exits(void) {
                                                      DISPATCH_PROC_EXIT, dispatch_get_main_queue());
         if (!s) continue;
         dispatch_source_set_event_handler(s, ^{
-            dispatch_source_cancel(s);
-            [gExitWatch removeObjectForKey:pid];
-            refresh("app");
-            watch_app_exits();
+            @autoreleasepool {
+                dispatch_source_cancel(s);
+                [gExitWatch removeObjectForKey:pid];
+                refresh("app");
+                watch_app_exits();
+            }
         });
         gExitWatch[pid] = s;
         dispatch_resume(s);
@@ -278,8 +284,10 @@ static void watch_app_exits(void) {
 }
 
 static void refresh_apps(const char *why) {
-    refresh(why);
-    watch_app_exits();
+    @autoreleasepool {
+        refresh(why);
+        watch_app_exits();
+    }
 }
 
 // 有些事件會一口氣來好幾個（螢幕重新設定、assertion 變化），合併成一次處理
@@ -287,8 +295,10 @@ static void debounce(BOOL *pending, double secs, void (^block)(void)) {
     if (*pending) return;
     *pending = YES;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(secs * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        *pending = NO;
-        block();
+        @autoreleasepool {
+            *pending = NO;
+            block();
+        }
     });
 }
 
@@ -320,19 +330,21 @@ static void register_assertion_events(void) {
     if (gAssertionNotify) gAssertionNotify("com.apple.system.powermanagement.assertions.anychange", 1);
 }
 
-// 設定檔被修改或取代（文字編輯器存檔通常是「寫新檔再改名」）→ 通知監視程式重新讀取
-static void watch_config(void);
-static void watch_config_later(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2), dispatch_get_main_queue(), ^{ watch_config(); });
-}
+// 設定檔被修改或取代（文字編輯器存檔通常是「寫新檔再改名」）→ 通知監視程式重新讀取。
+// 被取代時舊的監看會失效：立刻改監看新檔案（新檔案還沒出現就每 50 ms 再試），
+// 重新監看成功後再通知一次，這樣「舊監看失效」到「新監看生效」之間的修改也不會漏掉。
 static dispatch_source_t gConfigSrc;
-static void watch_config(void) {
+static void watch_config(BOOL announce);
+static void watch_config_soon(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 20), dispatch_get_main_queue(), ^{ watch_config(YES); });
+}
+static void watch_config(BOOL announce) {
     static int retries;
     if (!gConfigPath) return;
     if (gConfigSrc) { dispatch_source_cancel(gConfigSrc); gConfigSrc = nil; }
     int fd = open(gConfigPath.fileSystemRepresentation, O_EVTONLY);
     if (fd < 0) {
-        if (++retries <= 20) watch_config_later();   // 存檔中途短暫不存在；之後由心跳重試
+        if (++retries <= 40) watch_config_soon();   // 存檔中途短暫不存在；2 秒後還沒有就交給心跳重試
         return;
     }
     retries = 0;
@@ -343,17 +355,24 @@ static void watch_config(void) {
     if (!src) { close(fd); return; }
     dispatch_source_set_cancel_handler(src, ^{ close(fd); });
     dispatch_source_set_event_handler(src, ^{
-        unsigned long f = dispatch_source_get_data(src);
-        read_all();
-        emit("config", YES);
-        if (f & (DISPATCH_VNODE_DELETE | DISPATCH_VNODE_RENAME | DISPATCH_VNODE_REVOKE)) {
-            dispatch_source_cancel(src);
-            if (gConfigSrc == src) gConfigSrc = nil;
-            watch_config_later();
+        @autoreleasepool {
+            unsigned long f = dispatch_source_get_data(src);
+            if (f & (DISPATCH_VNODE_DELETE | DISPATCH_VNODE_RENAME | DISPATCH_VNODE_REVOKE)) {
+                watch_config(YES);   // 改監看新檔案，成功後會通知
+            } else {
+                read_all();
+                emit("config", YES);
+            }
         }
     });
     gConfigSrc = src;
     dispatch_resume(src);
+    if (announce) {
+        @autoreleasepool {
+            read_all();
+            emit("config", YES);
+        }
+    }
 }
 
 static void exit_when_gone(pid_t pid) {
@@ -463,22 +482,26 @@ int main(int argc, char **argv) {
             });
         }
 
-        watch_config();
+        watch_config(NO);
 
         signal(SIGUSR1, SIG_IGN);
         dispatch_source_t ping = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGUSR1, 0, dispatch_get_main_queue());
-        dispatch_source_set_event_handler(ping, ^{ read_all(); watch_app_exits(); emit("ping", YES); });
+        dispatch_source_set_event_handler(ping, ^{
+            @autoreleasepool { read_all(); watch_app_exits(); emit("ping", YES); }
+        });
         dispatch_resume(ping);
 
         dispatch_source_t tick = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
         uint64_t interval = (uint64_t)(gTick * NSEC_PER_SEC);
         dispatch_source_set_timer(tick, dispatch_time(DISPATCH_TIME_NOW, (int64_t)interval), interval, interval / 10);
         dispatch_source_set_event_handler(tick, ^{
-            register_assertion_events();   // powerd 重新啟動過的話要重新登記（重複登記沒有副作用）
-            if (gConfigPath && !gConfigSrc) watch_config();   // 之前設定檔不存在 → 再試一次
-            read_all();
-            watch_app_exits();
-            emit("tick", YES);
+            @autoreleasepool {
+                register_assertion_events();   // powerd 重新啟動過的話要重新登記（重複登記沒有副作用）
+                if (gConfigPath && !gConfigSrc) watch_config(YES);   // 之前設定檔不存在 → 再試一次
+                read_all();
+                watch_app_exits();
+                emit("tick", YES);
+            }
         });
         dispatch_resume(tick);
 
